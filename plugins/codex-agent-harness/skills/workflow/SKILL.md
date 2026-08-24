@@ -11,4 +11,6 @@ Before changing files, read [references/protocol.md](references/protocol.md) com
 
 Claude may use the `implement` profile only when the user explicitly requests Claude as the writer for the current task. Otherwise use Claude once, as a fresh read-only `critic`, after deterministic checks pass.
 
+After implementation and current-diff checks are complete, use the `delivery-writing` skill when the task needs Jira wording, testing recommendations, a PR description, or colleague-facing review comments. Those artifacts are derived from the verified implementation and do not grant permission to publish them.
+
 Do not treat local completion as permission to push, publish a pull request, change a tracker, deploy, run a migration, or perform another external or irreversible action. Preserve the user's unrelated changes.

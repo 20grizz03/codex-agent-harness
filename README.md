@@ -2,7 +2,16 @@
 
 `codex-agent-harness` is a local Codex plugin for durable repository-changing tasks. Codex records an immutable task contract, runs deterministic checks through its normal sandbox, obtains one fresh independent Claude review, verifies the findings, and completes only against evidence tied to the current diff.
 
+The plugin includes delivery-writing conventions: compact Jira tasks, post-implementation testing recommendations, one- or two-sentence PR descriptions, natural Russian technical prose, and concise colleague-facing review comments. Drafting text does not authorize changing Jira or publishing to GitHub.
+
 The plugin deliberately does not balance subscriptions, compare providers, schedule tracker work, run a daemon, or fall back to another model.
+
+## Skills
+
+- `workflow` runs repository mutations through the durable Codex-led cycle.
+- `review` obtains and verifies an independent read-only review.
+- `setup` checks the Claude subscription runtime without model inference.
+- `delivery-writing` prepares Jira tasks, post-implementation testing recommendations, concise PR descriptions, and review comments without publishing them.
 
 ## Install locally
 

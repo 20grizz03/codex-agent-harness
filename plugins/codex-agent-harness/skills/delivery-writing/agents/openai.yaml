@@ -1,0 +1,6 @@
+interface:
+  display_name: "Delivery Writing"
+  short_description: "Jira, PR, QA, and review text conventions"
+  default_prompt: "Use $delivery-writing to draft delivery text from the verified implementation."
+policy:
+  allow_implicit_invocation: true

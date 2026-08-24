@@ -43,3 +43,9 @@ If Claude wrote the change, Codex performs the independent review and supplies t
 At most one correction pass is allowed. After an accepted finding is fixed, call `plan_checks` again and rerun every required check for the new fingerprint. Do not launch a second Claude critic in v1.
 
 Call `finish_run` with `complete` only when the server confirms that current checks pass, an independent review exists, all findings are resolved, and no blocking question remains. Use `needs_human` for scope expansion, unresolved P0/P1 findings, dirty-file ownership, or a required user decision. Use `blocked`, `failed`, or `interrupted` only for their literal terminal conditions.
+
+## 6. Prepare delivery text
+
+After the final diff, checks, and review are known, load the `delivery-writing` skill when the task reaches a Jira or PR handoff. Build the full testing-recommendations block from the verified behavior, not from the original plan. Keep the PR description to one or two sentences about the implemented outcome and its important boundary.
+
+Draft these artifacts locally by default. Show the complete Jira block or exact review-comment wording before any external change, and wait for explicit publication approval.

@@ -1,7 +1,7 @@
 {
   "name": "codex-agent-harness",
-  "version": "0.1.0",
-  "description": "Run repository changes through durable checks and an independent Claude review while Codex remains the lead.",
+  "version": "0.1.0+codex.20260824061712",
+  "description": "Run repository changes through durable checks, independent Claude review, and verified delivery writing while Codex remains the lead.",
   "author": {
     "name": "Andrei Semeniuk"
   },
@@ -10,14 +10,16 @@
     "agent-harness",
     "claude-code",
     "code-review",
+    "delivery-writing",
     "durable-workflow",
+    "jira",
     "verification"
   ],
   "skills": "./skills/",
   "interface": {
     "displayName": "Codex Agent Harness",
     "shortDescription": "Durable coding loop with independent review",
-    "longDescription": "Codex leads repository changes, records an immutable task contract and check evidence, and uses Claude Opus as a fresh independent critic before completion.",
+    "longDescription": "Codex leads repository changes, records an immutable task contract and check evidence, uses Claude Opus as a fresh independent critic, and prepares Jira, testing, PR, and review text from the verified implementation.",
     "developerName": "Andrei Semeniuk",
     "category": "DeveloperTools",
     "capabilities": [
@@ -28,7 +30,8 @@
     "defaultPrompt": [
       "Implement this repository change through the durable Agent Harness workflow.",
       "Review the current changes with an independent Claude critic and Codex triage.",
-      "Check whether the local Claude subscription runtime is ready without invoking a model."
+      "Check whether the local Claude subscription runtime is ready without invoking a model.",
+      "Draft Jira and PR delivery text from the verified implementation using the project's writing conventions."
     ]
   },
   "mcpServers": "./.mcp.json"
