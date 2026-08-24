@@ -14,20 +14,42 @@ Version 2.1 can read Jira epics and GitHub Enterprise delivery state through con
 - `delivery-writing` prepares Jira tasks, post-implementation testing recommendations, concise PR descriptions, and review comments without publishing them.
 - `epic-workflow` decomposes an epic into durable v1 runs and can perform a blind replay of a closed epic before comparing with historical Jira, PR, and Git evidence.
 
-## Install locally
+## Install on another computer
+
+Install from the public repository using the native Codex marketplace flow:
 
 ```bash
-codex plugin marketplace add <path-to-codex-agent-harness>
+codex plugin marketplace add 20grizz03/codex-agent-harness --ref main
 codex plugin add codex-agent-harness@agent-harness-local
 ```
 
-Start a new Codex task after installation so the skills and MCP tools are discovered from the installed snapshot.
+Ponytail is the default companion skill for keeping implementations small:
+
+```bash
+codex plugin marketplace add https://github.com/DietrichGebert/ponytail.git
+codex plugin add ponytail@ponytail
+```
 
 Claude inference is subscription-only. Authenticate interactively when needed:
 
 ```bash
 claude auth login
 ```
+
+Start a new Codex task after installation so the skills and MCP tools are discovered from the installed snapshot. Ask Codex to check Agent Harness setup; the check does not invoke a model or install anything.
+
+See [`plugins/codex-agent-harness/docs/dependencies.md`](plugins/codex-agent-harness/docs/dependencies.md) for the complete runtime, companion-skill, connector, and development-tool inventory bundled with the plugin.
+
+## Install from a local checkout
+
+Run from the repository root:
+
+```bash
+codex plugin marketplace add .
+codex plugin add codex-agent-harness@agent-harness-local
+```
+
+Start a new Codex task after installation so the skills and MCP tools are discovered from the installed snapshot.
 
 `check_runtime` reports readiness without invoking a model and refuses inference when API/provider-billing environment variables are active.
 

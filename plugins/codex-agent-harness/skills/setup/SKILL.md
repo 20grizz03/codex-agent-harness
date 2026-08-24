@@ -1,6 +1,6 @@
 ---
 name: setup
-description: Check and troubleshoot the local Claude Code runtime used by Agent Harness without invoking a model. Use for installation, authentication, subscription billing guards, required CLI flags, or Agent Harness readiness problems.
+description: Check and troubleshoot the local Agent Harness runtime and external companion dependencies without invoking a model. Use for installation on another computer, Claude authentication and billing guards, Ponytail, required CLI tools, or Jira, GitHub Enterprise, and Telegram MCP readiness.
 ---
 
 # Agent Harness Setup
@@ -10,3 +10,20 @@ Call `agent-harness.check_runtime` directly. This tool must never invoke a model
 Report the resolved Claude path and version, public authentication fields, required-flag support, configured model, and names of active API/provider-billing environment variables. Never report their values.
 
 Readiness requires Claude Code, all safety flags, a logged-in account, and no active `ANTHROPIC_API_KEY`, custom Anthropic base URL, Bedrock, Vertex, or Foundry routing. There is no bypass for API billing. If logged out, ask the user to run `claude auth login` interactively; do not run that login command on their behalf.
+
+When the user asks to prepare or audit another computer, also perform these read-only checks:
+
+1. Resolve `codex`, `git`, `python3`, and `claude` from `PATH` and report their paths and public versions.
+2. Use `codex plugin list --json` to check only whether `codex-agent-harness@agent-harness-local` and `ponytail@ponytail` are installed and enabled. Summarize those fields; do not reproduce the raw response.
+3. Inspect active skill names only for project-specific profiles required by the target repository; do not copy or traverse the user's personal skill directories.
+4. Inspect the active MCP tool names. If needed, use plain `codex mcp list` and report only server names and enabled state. Never use or reproduce JSON MCP configuration because server definitions may contain inline credentials.
+5. Classify missing components against [`docs/dependencies.md`](../../docs/dependencies.md): core runtime blocks Agent Harness readiness; missing Jira, GitHub Enterprise, Telegram, or required project-specific components blocks only that integration profile; missing `gh` or `gitleaks` is an optional-tool notice. Treat GitHub Enterprise MCP as the primary GitHub interface and `gh` only as a diagnostic or narrow fallback.
+
+If Ponytail is missing, print these commands without running them:
+
+```bash
+codex plugin marketplace add https://github.com/DietrichGebert/ponytail.git
+codex plugin add ponytail@ponytail
+```
+
+For a missing external connector or personal skill, point to its dependency entry instead of inventing configuration. Never install software, authenticate an account, copy a session, or modify Codex configuration without a separate explicit request.
