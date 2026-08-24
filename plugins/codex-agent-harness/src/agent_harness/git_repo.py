@@ -154,8 +154,24 @@ def diff_fingerprint(
     if completed.returncode != 0:
         raise InputError("unable to calculate the Git diff fingerprint")
 
+    names = run_git(
+        context.repo_root,
+        ["diff", "--name-only", "-z", base, "--"],
+        text=False,
+        timeout=60,
+    )
+    if names.returncode != 0:
+        raise InputError("unable to calculate the changed Git paths")
+
     records = _status_records(context)
-    paths = unique_in_order(path for _status, path in records)
+    diff_paths = [
+        os.fsdecode(path)
+        for path in (names.stdout or b"").split(b"\0")
+        if path
+    ]
+    paths = unique_in_order(
+        [*diff_paths, *(path for _status, path in records)]
+    )
     digest = hashlib.sha256()
     digest.update(b"agent-harness-diff-v1\0")
     digest.update(base.encode("ascii", errors="strict"))

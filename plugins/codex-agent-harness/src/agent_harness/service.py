@@ -8,6 +8,13 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from . import claude_runtime
+from .campaign import (
+    CAMPAIGN_TERMINAL_PHASES,
+    COMPARISON_DIMENSIONS,
+    TASK_STATUSES,
+    CampaignStore,
+    build_campaign,
+)
 from .claude_runtime import ManagedStage
 from .contract import build_contract
 from .git_repo import diff_fingerprint, resolve_repo
@@ -18,6 +25,7 @@ from .util import (
     InputError,
     StateError,
     require_string,
+    sanitize_string_list,
     sanitize_text,
     utc_now,
 )
@@ -51,6 +59,12 @@ class HarnessService:
     @staticmethod
     def _run_id(arguments: Mapping[str, Any]) -> str:
         return require_string(arguments.get("run_id"), "run_id", maximum=128)
+
+    @staticmethod
+    def _campaign_id(arguments: Mapping[str, Any]) -> str:
+        return require_string(
+            arguments.get("campaign_id"), "campaign_id", maximum=128
+        )
 
     @staticmethod
     def _transition(state: dict[str, Any], phase: str) -> None:
@@ -196,6 +210,674 @@ class HarnessService:
                     }
                 )
         return {"runs": runs}
+
+    @staticmethod
+    def _public_campaign(
+        contract: dict[str, Any],
+        state: dict[str, Any],
+        comparison: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "contract": contract,
+            "state": state,
+            "comparison": comparison,
+        }
+
+    @staticmethod
+    def _require_campaign_open(state: Mapping[str, Any]) -> None:
+        if state.get("phase") in CAMPAIGN_TERMINAL_PHASES:
+            raise StateError(
+                f"campaign is already terminal: {state.get('phase')}"
+            )
+
+    def create_campaign(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        workspace = self._workspace(arguments)
+        context = resolve_repo(workspace)
+        contract, state = build_campaign(dict(arguments), context)
+        store = CampaignStore(context)
+        with self._lock:
+            store.create(contract, state)
+            store.append_event(
+                contract["campaign_id"],
+                {"type": "phase_changed", "from": "prepared", "to": "executing"},
+            )
+        return self._public_campaign(
+            contract,
+            state,
+            store.read_comparison(contract["campaign_id"]),
+        )
+
+    def get_campaign(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        store = CampaignStore.for_workspace(self._workspace(arguments))
+        campaign_id = self._campaign_id(arguments)
+        with self._lock:
+            contract = store.read_contract(campaign_id)
+            state = store.read_state(campaign_id)
+            comparison = store.read_comparison(campaign_id)
+        return self._public_campaign(contract, state, comparison)
+
+    def list_campaigns(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        store = CampaignStore.for_workspace(self._workspace(arguments))
+        raw_limit = arguments.get("limit", 25)
+        if not isinstance(raw_limit, int) or isinstance(raw_limit, bool):
+            raise InputError("limit must be an integer")
+        limit = max(1, min(raw_limit, 100))
+        campaigns: list[dict[str, Any]] = []
+        with self._lock:
+            for campaign_id in list(store.list_campaign_ids())[:limit]:
+                try:
+                    contract = store.read_contract(campaign_id)
+                    state = store.read_state(campaign_id)
+                except StateError as exc:
+                    campaigns.append(
+                        {"campaign_id": campaign_id, "error": str(exc)}
+                    )
+                    continue
+                task_states = state.get("tasks", {})
+                campaigns.append(
+                    {
+                        "campaign_id": campaign_id,
+                        "title": contract.get("title"),
+                        "mode": contract.get("mode"),
+                        "phase": state.get("phase"),
+                        "task_count": len(task_states)
+                        if isinstance(task_states, dict)
+                        else 0,
+                        "completed_tasks": sum(
+                            1
+                            for task in task_states.values()
+                            if isinstance(task, dict)
+                            and task.get("status") == "complete"
+                        )
+                        if isinstance(task_states, dict)
+                        else 0,
+                        "created_at": state.get("created_at"),
+                        "updated_at": state.get("updated_at"),
+                    }
+                )
+        return {"campaigns": campaigns}
+
+    @staticmethod
+    def _campaign_task_definition(
+        contract: Mapping[str, Any], task_id: str
+    ) -> dict[str, Any]:
+        for task in contract.get("tasks", []):
+            if isinstance(task, dict) and task.get("id") == task_id:
+                return task
+        raise StateError(f"unknown campaign task: {task_id}")
+
+    @staticmethod
+    def _completed_run_reference(
+        workspace: str,
+        run_id: str,
+        definition: Mapping[str, Any],
+        task_states: Mapping[str, Any],
+        task_id: str,
+    ) -> dict[str, Any]:
+        run_store = RunStore.for_workspace(workspace)
+        run_contract = run_store.read_contract(run_id)
+        run_state = run_store.read_state(run_id)
+        terminal = run_state.get("terminal")
+        if run_state.get("phase") != "complete" or not (
+            isinstance(terminal, dict) and terminal.get("status") == "complete"
+        ):
+            raise StateError("implementation task requires a completed v1 run")
+
+        contract_repo_root = run_contract.get("repo_root")
+        if not isinstance(contract_repo_root, str) or (
+            Path(contract_repo_root).resolve() != run_store.context.repo_root
+        ):
+            raise StateError("v1 run workspace does not match run_workspace")
+
+        expected_workspace = definition.get("workspace")
+        if not isinstance(expected_workspace, str) or (
+            Path(expected_workspace).resolve() != run_store.context.repo_root
+        ):
+            raise StateError(
+                "v1 run workspace does not match the campaign task contract"
+            )
+
+        expected_base = definition.get("base_sha")
+        actual_base = run_contract.get("base_sha")
+        if not isinstance(expected_base, str) or not isinstance(actual_base, str):
+            raise StateError("campaign task and v1 run require a base_sha")
+        if not actual_base.lower().startswith(expected_base.lower()):
+            raise StateError(
+                "v1 run base_sha does not match the campaign task contract"
+            )
+
+        for other_task_id, other_state in task_states.items():
+            if other_task_id == task_id or not isinstance(other_state, dict):
+                continue
+            other_run = other_state.get("run")
+            if isinstance(other_run, dict) and other_run.get("run_id") == run_id:
+                raise StateError(
+                    f"v1 run is already linked to campaign task {other_task_id}"
+                )
+
+        fingerprint = run_state.get("diff_fingerprint")
+        if not isinstance(fingerprint, str):
+            raise StateError("completed v1 run is missing its diff fingerprint")
+        return {
+            "workspace": str(run_store.context.repo_root),
+            "run_id": run_id,
+            "base_sha": actual_base,
+            "diff_fingerprint": fingerprint,
+            "risk": run_state.get("risk"),
+            "changed_paths": list(run_state.get("changed_paths", [])),
+        }
+
+    @staticmethod
+    def _candidate_git_snapshots(
+        contract: Mapping[str, Any],
+        task_states: Mapping[str, Any],
+    ) -> list[dict[str, Any]]:
+        primary_workspace = require_string(
+            contract.get("repo_root"), "campaign.repo_root", maximum=4_096
+        )
+        primary_base = require_string(
+            contract.get("base_sha"), "campaign.base_sha", maximum=64
+        )
+        repositories: dict[str, dict[str, Any]] = {
+            str(Path(primary_workspace).resolve()): {
+                "base_sha": primary_base,
+                "covered_paths": set(),
+            }
+        }
+
+        for task_state in task_states.values():
+            if not isinstance(task_state, dict):
+                continue
+            run = task_state.get("run")
+            if not isinstance(run, dict):
+                continue
+            workspace = require_string(
+                run.get("workspace"), "campaign task run workspace", maximum=4_096
+            )
+            base_sha = require_string(
+                run.get("base_sha"), "campaign task run base_sha", maximum=64
+            )
+            key = str(Path(workspace).resolve())
+            repository = repositories.setdefault(
+                key,
+                {"base_sha": base_sha, "covered_paths": set()},
+            )
+            changed = run.get("changed_paths", [])
+            if not isinstance(changed, list) or not all(
+                isinstance(path, str) for path in changed
+            ):
+                raise StateError("campaign task run changed_paths are corrupt")
+            repository["covered_paths"].update(changed)
+
+        snapshots: list[dict[str, Any]] = []
+        for workspace, repository in repositories.items():
+            context = resolve_repo(workspace)
+            fingerprint, changed = diff_fingerprint(
+                context,
+                base_sha=str(repository["base_sha"]),
+            )
+            uncovered = sorted(
+                set(changed) - set(repository["covered_paths"])
+            )
+            if uncovered:
+                raise StateError(
+                    "candidate contains paths not covered by completed v1 runs in "
+                    f"{workspace}: {', '.join(uncovered[:8])}"
+                )
+            snapshots.append(
+                {
+                    "workspace": workspace,
+                    "base_sha": repository["base_sha"],
+                    "head_sha": context.head_sha,
+                    "diff_fingerprint": fingerprint,
+                    "changed_paths": changed,
+                }
+            )
+        return snapshots
+
+    def record_campaign_task(
+        self, arguments: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        store = CampaignStore.for_workspace(self._workspace(arguments))
+        campaign_id = self._campaign_id(arguments)
+        task_id = require_string(arguments.get("task_id"), "task_id", maximum=80)
+        status = require_string(arguments.get("status"), "status", maximum=32)
+        if status not in TASK_STATUSES - {"pending"}:
+            raise InputError(
+                "status must be in_progress, complete, needs_human, blocked, failed, or interrupted"
+            )
+        summary = sanitize_text(arguments.get("summary"), maximum=2_000)
+        with self._lock:
+            contract = store.read_contract(campaign_id)
+            state = store.read_state(campaign_id)
+            definition = self._campaign_task_definition(contract, task_id)
+            task_states = state.get("tasks")
+            if not isinstance(task_states, dict):
+                raise StateError("campaign task state is corrupt")
+            task_state = task_states.get(task_id)
+            if not isinstance(task_state, dict):
+                raise StateError(f"missing campaign task state: {task_id}")
+            current = task_state.get("status")
+            if current == status:
+                return {
+                    "campaign_id": campaign_id,
+                    "task_id": task_id,
+                    "task": task_state,
+                    "deduplicated": True,
+                }
+            self._require_campaign_open(state)
+            allowed = {
+                "pending": TASK_STATUSES - {"pending"},
+                "in_progress": TASK_STATUSES - {"pending"},
+                "needs_human": {"in_progress", "complete", "blocked", "failed"},
+                "blocked": {"in_progress"},
+                "failed": {"in_progress"},
+                "interrupted": {"in_progress"},
+            }
+            if status not in allowed.get(str(current), set()):
+                raise StateError(
+                    f"campaign task cannot transition from {current} to {status}"
+                )
+            if status in {"in_progress", "complete"}:
+                outstanding_dependencies = [
+                    dependency
+                    for dependency in definition.get("dependencies", [])
+                    if not (
+                        isinstance(task_states.get(dependency), dict)
+                        and task_states[dependency].get("status") == "complete"
+                    )
+                ]
+                if outstanding_dependencies:
+                    raise StateError(
+                        "campaign task dependencies are not complete: "
+                        + ", ".join(outstanding_dependencies)
+                    )
+
+            run_reference = None
+            if status == "complete" and definition.get("kind") == "implementation":
+                run_workspace = require_string(
+                    arguments.get("run_workspace"),
+                    "run_workspace",
+                    maximum=4_096,
+                )
+                run_id = self._run_id(arguments)
+                run_reference = self._completed_run_reference(
+                    run_workspace,
+                    run_id,
+                    definition,
+                    task_states,
+                    task_id,
+                )
+            elif arguments.get("run_workspace") is not None or arguments.get(
+                "run_id"
+            ) is not None:
+                raise InputError(
+                    "run_workspace and run_id are only valid for a completed implementation task"
+                )
+
+            task_state["status"] = status
+            task_state["summary"] = summary
+            task_state["run"] = run_reference
+            task_state["updated_at"] = utc_now()
+            state = store.save_state(campaign_id, state)
+            store.append_event(
+                campaign_id,
+                {
+                    "type": "campaign_task_recorded",
+                    "task_id": task_id,
+                    "status": status,
+                    "run_id": run_reference.get("run_id")
+                    if isinstance(run_reference, dict)
+                    else None,
+                },
+            )
+        return {
+            "campaign_id": campaign_id,
+            "task_id": task_id,
+            "task": state["tasks"][task_id],
+            "deduplicated": False,
+        }
+
+    def record_campaign_intervention(
+        self, arguments: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        store = CampaignStore.for_workspace(self._workspace(arguments))
+        campaign_id = self._campaign_id(arguments)
+        intervention_id = require_string(
+            arguments.get("intervention_id"), "intervention_id", maximum=80
+        )
+        kind = require_string(arguments.get("kind"), "kind", maximum=32)
+        if kind not in {"blocking_question", "approval", "correction", "context"}:
+            raise InputError(
+                "kind must be blocking_question, approval, correction, or context"
+            )
+        blocking = arguments.get("blocking", False)
+        resolved = arguments.get("resolved", False)
+        if not isinstance(blocking, bool) or not isinstance(resolved, bool):
+            raise InputError("blocking and resolved must be booleans")
+        reason = sanitize_text(
+            require_string(arguments.get("reason"), "reason", maximum=2_000),
+            maximum=2_000,
+        )
+        outcome = sanitize_text(arguments.get("outcome"), maximum=2_000)
+        if resolved and not outcome:
+            raise InputError("a resolved intervention requires an outcome summary")
+        normalized = {
+            "intervention_id": intervention_id,
+            "kind": kind,
+            "blocking": blocking,
+            "resolved": resolved,
+            "reason": reason,
+            "outcome": outcome,
+        }
+        with self._lock:
+            state = store.read_state(campaign_id)
+            interventions = state.get("interventions")
+            if not isinstance(interventions, dict):
+                raise StateError("campaign interventions are corrupt")
+            existing = interventions.get(intervention_id)
+            if isinstance(existing, dict):
+                comparable = {key: existing.get(key) for key in normalized}
+                if comparable == normalized:
+                    return {
+                        "campaign_id": campaign_id,
+                        "intervention": existing,
+                        "deduplicated": True,
+                    }
+                self._require_campaign_open(state)
+                immutable = ("intervention_id", "kind", "blocking", "reason")
+                if (
+                    all(existing.get(key) == normalized[key] for key in immutable)
+                    and existing.get("resolved") is False
+                    and resolved is True
+                ):
+                    existing["resolved"] = True
+                    existing["outcome"] = outcome
+                    existing["resolved_at"] = utc_now()
+                    state = store.save_state(campaign_id, state)
+                    store.append_event(
+                        campaign_id,
+                        {
+                            "type": "campaign_intervention_resolved",
+                            "intervention_id": intervention_id,
+                        },
+                    )
+                    return {
+                        "campaign_id": campaign_id,
+                        "intervention": state["interventions"][intervention_id],
+                        "deduplicated": False,
+                    }
+                raise StateError(f"intervention_id already exists: {intervention_id}")
+            self._require_campaign_open(state)
+            entry = {**normalized, "recorded_at": utc_now()}
+            interventions[intervention_id] = entry
+            state = store.save_state(campaign_id, state)
+            store.append_event(
+                campaign_id,
+                {
+                    "type": "campaign_intervention_recorded",
+                    "intervention_id": intervention_id,
+                    "kind": kind,
+                    "blocking": blocking,
+                    "resolved": resolved,
+                },
+            )
+        return {
+            "campaign_id": campaign_id,
+            "intervention": state["interventions"][intervention_id],
+            "deduplicated": False,
+        }
+
+    @staticmethod
+    def _unresolved_campaign_blockers(state: Mapping[str, Any]) -> list[str]:
+        interventions = state.get("interventions", {})
+        if not isinstance(interventions, dict):
+            return ["campaign interventions are corrupt"]
+        return [
+            intervention_id
+            for intervention_id, intervention in interventions.items()
+            if isinstance(intervention, dict)
+            and intervention.get("blocking") is True
+            and intervention.get("resolved") is not True
+        ]
+
+    def seal_campaign_candidate(
+        self, arguments: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        store = CampaignStore.for_workspace(self._workspace(arguments))
+        campaign_id = self._campaign_id(arguments)
+        summary = sanitize_text(
+            require_string(arguments.get("summary"), "summary", maximum=4_000),
+            maximum=4_000,
+        )
+        with self._lock:
+            contract = store.read_contract(campaign_id)
+            state = store.read_state(campaign_id)
+            existing = state.get("candidate")
+            if isinstance(existing, dict):
+                if existing.get("summary") != summary:
+                    raise StateError("campaign candidate is already sealed")
+                return {
+                    "campaign_id": campaign_id,
+                    "candidate": existing,
+                    "deduplicated": True,
+                }
+            self._require_campaign_open(state)
+            task_states = state.get("tasks")
+            if not isinstance(task_states, dict):
+                raise StateError("campaign task state is corrupt")
+            incomplete = [
+                task_id
+                for task_id, task in task_states.items()
+                if not (
+                    isinstance(task, dict) and task.get("status") == "complete"
+                )
+            ]
+            if incomplete:
+                raise StateError(
+                    "candidate cannot be sealed before all tasks complete: "
+                    + ", ".join(incomplete)
+                )
+            unresolved = self._unresolved_campaign_blockers(state)
+            if unresolved:
+                raise StateError(
+                    "candidate has unresolved blocking interventions: "
+                    + ", ".join(unresolved)
+                )
+            interventions = state.get("interventions", {})
+            run_references = [
+                task["run"]
+                for task in task_states.values()
+                if isinstance(task, dict) and isinstance(task.get("run"), dict)
+            ]
+            git_snapshots = self._candidate_git_snapshots(
+                contract,
+                task_states,
+            )
+            candidate = {
+                "summary": summary,
+                "sealed_at": utc_now(),
+                "task_count": len(task_states),
+                "run_references": run_references,
+                "git_snapshots": git_snapshots,
+                "human_interventions": {
+                    "total": len(interventions),
+                    "blocking_questions": sum(
+                        1
+                        for item in interventions.values()
+                        if isinstance(item, dict)
+                        and item.get("kind") == "blocking_question"
+                    ),
+                    "corrections": sum(
+                        1
+                        for item in interventions.values()
+                        if isinstance(item, dict)
+                        and item.get("kind") == "correction"
+                    ),
+                },
+            }
+            state["candidate"] = candidate
+            self._transition(state, "candidate_ready")
+            state = store.save_state(campaign_id, state)
+            store.append_event(
+                campaign_id,
+                {
+                    "type": "campaign_candidate_sealed",
+                    "task_count": len(task_states),
+                    "intervention_count": len(interventions),
+                },
+            )
+        return {
+            "campaign_id": campaign_id,
+            "candidate": state["candidate"],
+            "deduplicated": False,
+        }
+
+    def record_campaign_comparison(
+        self, arguments: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        store = CampaignStore.for_workspace(self._workspace(arguments))
+        campaign_id = self._campaign_id(arguments)
+        raw_rubric = arguments.get("rubric")
+        if not isinstance(raw_rubric, Mapping):
+            raise InputError("rubric must be an object")
+        if set(raw_rubric) != set(COMPARISON_DIMENSIONS):
+            raise InputError(
+                "rubric must contain exactly: " + ", ".join(COMPARISON_DIMENSIONS)
+            )
+        rubric: dict[str, int] = {}
+        for dimension in COMPARISON_DIMENSIONS:
+            value = raw_rubric.get(dimension)
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or not 0 <= value <= 4
+            ):
+                raise InputError(f"rubric.{dimension} must be an integer from 0 to 4")
+            rubric[dimension] = value
+        normalized = {
+            "rubric": rubric,
+            "similarities": sanitize_string_list(
+                arguments.get("similarities"), item_maximum=2_000
+            ),
+            "differences": sanitize_string_list(
+                arguments.get("differences"), item_maximum=2_000
+            ),
+            "residual_risks": sanitize_string_list(
+                arguments.get("residual_risks"), item_maximum=2_000
+            ),
+            "historical_refs": sanitize_string_list(
+                arguments.get("historical_refs"), item_maximum=1_000
+            ),
+        }
+        with self._lock:
+            contract = store.read_contract(campaign_id)
+            state = store.read_state(campaign_id)
+            comparison_file = store.read_comparison(campaign_id)
+            existing = comparison_file.get("comparison")
+            if isinstance(existing, dict):
+                comparable = {key: existing.get(key) for key in normalized}
+                if comparable != normalized:
+                    raise StateError("campaign comparison is already recorded")
+                return {
+                    "campaign_id": campaign_id,
+                    "comparison": existing,
+                    "deduplicated": True,
+                }
+            self._require_campaign_open(state)
+            if contract.get("mode") != "replay":
+                raise StateError("historical comparison is only valid for replay campaigns")
+            if state.get("phase") != "candidate_ready" or not isinstance(
+                state.get("candidate"), dict
+            ):
+                raise StateError(
+                    "seal the replay candidate before reading or recording historical evidence"
+                )
+            comparison = {
+                "recorded_at": utc_now(),
+                **normalized,
+                "overall_percent": round(
+                    sum(rubric.values()) / (4 * len(COMPARISON_DIMENSIONS)) * 100
+                ),
+            }
+            comparison_file["comparison"] = comparison
+            store.save_comparison(campaign_id, comparison_file)
+            self._transition(state, "comparing")
+            state = store.save_state(campaign_id, state)
+            store.append_event(
+                campaign_id,
+                {
+                    "type": "campaign_comparison_recorded",
+                    "overall_percent": comparison["overall_percent"],
+                },
+            )
+        return {
+            "campaign_id": campaign_id,
+            "comparison": comparison,
+            "deduplicated": False,
+        }
+
+    def finish_campaign(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        store = CampaignStore.for_workspace(self._workspace(arguments))
+        campaign_id = self._campaign_id(arguments)
+        status = require_string(arguments.get("status"), "status", maximum=32)
+        if status not in CAMPAIGN_TERMINAL_PHASES:
+            raise InputError(
+                "status must be complete, needs_human, blocked, failed, or interrupted"
+            )
+        summary = sanitize_text(arguments.get("summary"), maximum=2_000)
+        with self._lock:
+            contract = store.read_contract(campaign_id)
+            state = store.read_state(campaign_id)
+            existing = state.get("terminal")
+            if isinstance(existing, dict):
+                if existing.get("status") == status:
+                    return {
+                        "campaign_id": campaign_id,
+                        "phase": state.get("phase"),
+                        "terminal": existing,
+                        "deduplicated": True,
+                    }
+                raise StateError(
+                    f"campaign is already terminal: {existing.get('status')}"
+                )
+            if status == "complete":
+                if not isinstance(state.get("candidate"), dict):
+                    raise StateError("campaign candidate is not sealed")
+                unresolved = self._unresolved_campaign_blockers(state)
+                if unresolved:
+                    raise StateError(
+                        "campaign has unresolved blocking interventions: "
+                        + ", ".join(unresolved)
+                    )
+                if contract.get("mode") == "replay" and not isinstance(
+                    store.read_comparison(campaign_id).get("comparison"), dict
+                ):
+                    raise StateError("replay campaign requires a historical comparison")
+            elif status in {"needs_human", "blocked"} and not summary:
+                raise InputError(f"summary is required for {status}")
+            self._transition(state, status)
+            state["terminal"] = {
+                "status": status,
+                "at": utc_now(),
+                "summary": summary or "All local epic campaign gates passed",
+                "external_actions_authorized": False,
+            }
+            state = store.save_state(campaign_id, state)
+            store.append_event(
+                campaign_id,
+                {
+                    "type": "campaign_finished",
+                    "status": status,
+                    "external_actions_authorized": False,
+                },
+            )
+        return {
+            "campaign_id": campaign_id,
+            "phase": state.get("phase"),
+            "terminal": state.get("terminal"),
+            "deduplicated": False,
+        }
 
     def plan_checks(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
         store = RunStore.for_workspace(self._workspace(arguments))

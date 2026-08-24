@@ -1,7 +1,7 @@
 {
   "name": "codex-agent-harness",
-  "version": "0.1.0+codex.20260824061712",
-  "description": "Run repository changes through durable checks, independent Claude review, and verified delivery writing while Codex remains the lead.",
+  "version": "0.2.1+codex.20260824095158",
+  "description": "Run repository tasks and epic campaigns through durable checks, independent Claude review, and controlled Jira and GitHub Enterprise delivery while Codex remains the lead.",
   "author": {
     "name": "Andrei Semeniuk"
   },
@@ -12,14 +12,16 @@
     "code-review",
     "delivery-writing",
     "durable-workflow",
+    "epic",
     "jira",
+    "replay",
     "verification"
   ],
   "skills": "./skills/",
   "interface": {
     "displayName": "Codex Agent Harness",
-    "shortDescription": "Durable coding loop with independent review",
-    "longDescription": "Codex leads repository changes, records an immutable task contract and check evidence, uses Claude Opus as a fresh independent critic, and prepares Jira, testing, PR, and review text from the verified implementation.",
+    "shortDescription": "Durable task and epic delivery with review",
+    "longDescription": "Codex leads repository changes and epic campaigns, records immutable contracts and check evidence, uses Claude Opus as a fresh independent critic, and prepares controlled Jira, GitHub Enterprise, testing, PR, and review delivery from verified implementations.",
     "developerName": "Andrei Semeniuk",
     "category": "DeveloperTools",
     "capabilities": [
@@ -31,7 +33,9 @@
       "Implement this repository change through the durable Agent Harness workflow.",
       "Review the current changes with an independent Claude critic and Codex triage.",
       "Check whether the local Claude subscription runtime is ready without invoking a model.",
-      "Draft Jira and PR delivery text from the verified implementation using the project's writing conventions."
+      "Draft Jira and PR delivery text from the verified implementation using the project's writing conventions.",
+      "Run this Jira epic as a durable campaign with minimal supervision.",
+      "Replay this closed epic from a pre-implementation cutoff and compare the sealed result with history."
     ]
   },
   "mcpServers": "./.mcp.json"

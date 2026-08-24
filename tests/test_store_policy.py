@@ -37,6 +37,19 @@ class GitFingerprintTests(unittest.TestCase):
             self.assertNotEqual(first_untracked, second_untracked)
             self.assertIn("new.txt", paths)
 
+    def test_fingerprint_reports_committed_paths_since_base(self) -> None:
+        with _support.TempRepo() as repo:
+            base_sha = resolve_repo(repo.path).head_sha
+            (repo.path / "README.md").write_text("committed\n", encoding="utf-8")
+            _support.git(repo.path, "add", "README.md")
+            _support.git(repo.path, "commit", "-m", "change")
+
+            _fingerprint, paths = diff_fingerprint(
+                resolve_repo(repo.path),
+                base_sha=base_sha,
+            )
+            self.assertEqual(["README.md"], paths)
+
     def test_linked_worktree_has_isolated_absolute_git_dir(self) -> None:
         with _support.TempRepo() as repo, tempfile.TemporaryDirectory() as parent:
             worktree = Path(parent) / "isolated"

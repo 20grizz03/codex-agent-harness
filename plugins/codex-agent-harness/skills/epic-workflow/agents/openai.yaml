@@ -1,0 +1,4 @@
+interface:
+  display_name: "Epic Workflow"
+  short_description: "Autonomous Jira epic delivery and replay"
+  default_prompt: "Use $epic-workflow to plan and run this epic with minimal supervision."

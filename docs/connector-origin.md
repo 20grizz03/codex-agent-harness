@@ -8,4 +8,6 @@ The Claude process adapter is a clean extraction of invariants validated in the 
 - stream only allowlisted progress, discard stderr content and raw JSONL, support cancellation, and record actual model/usage metadata;
 - keep Codex as lead and expose model lifecycle through a visible native tracking subagent.
 
-The new repository intentionally excludes capacity policies, `claude_first` routing, subscription load balancing, provider comparison, blind A/B benchmarks, automatic fallback, separate architect/tester products, direct compatibility launchers, trackers, schedulers, and remote daemons.
+The repository intentionally excludes capacity policies, `claude_first` routing, subscription load balancing, provider comparison, blind provider A/B benchmarks, automatic fallback, separate architect/tester products, direct compatibility launchers, embedded tracker clients, schedulers, and remote daemons.
+
+The v2.1 `epic-workflow` skill may consume Jira and GitHub Enterprise MCP tools already configured in Codex. Those connectors remain outside the plugin process: the harness stores only sanitized contracts, references, intervention summaries, and comparison scores. It never stores connector credentials or raw responses, and local completion never authorizes an external write.

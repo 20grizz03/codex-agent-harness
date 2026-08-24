@@ -14,7 +14,10 @@ from .util import HarnessError, InputError, require_string
 PROTOCOL_VERSION = "2025-06-18"
 SERVER_NAME = "agent-harness"
 SERVER_INSTRUCTIONS = (
-    "Codex owns task state and deterministic checks. Model-backed lifecycle "
+    "Codex owns epic campaign state, task state, and deterministic checks. "
+    "Campaign completion is local and never authorizes tracker or GitHub writes. "
+    "A replay candidate must be sealed before historical evidence is compared. "
+    "Model-backed lifecycle "
     "tools start_stage, poll_stage, and cancel_stage are proxy-only: call them "
     "from one native tracking subagent, not from the user-facing lead. The "
     "critic profile is read-only. The implement profile requires explicit "
@@ -40,6 +43,7 @@ def _tool_result(payload: Mapping[str, Any], *, is_error: bool = False) -> dict[
 
 WORKSPACE = {"type": "string", "minLength": 1, "maxLength": 4096}
 RUN_ID = {"type": "string", "minLength": 1, "maxLength": 128}
+CAMPAIGN_ID = {"type": "string", "minLength": 1, "maxLength": 128}
 CHECK_SCHEMA = {
     "type": "object",
     "required": ["name", "argv"],
@@ -114,6 +118,52 @@ REVIEW_SCHEMA = {
     "additionalProperties": False,
 }
 
+CAMPAIGN_SOURCE_SCHEMA = {
+    "type": "object",
+    "required": ["kind", "ref"],
+    "properties": {
+        "kind": {"type": "string", "enum": ["jira", "local"]},
+        "ref": {"type": "string", "minLength": 1, "maxLength": 2000},
+    },
+    "additionalProperties": False,
+}
+CAMPAIGN_TASK_SCHEMA = {
+    "type": "object",
+    "required": ["id", "title", "goal", "done_when"],
+    "properties": {
+        "id": {"type": "string", "minLength": 1, "maxLength": 80},
+        "title": {"type": "string", "minLength": 1, "maxLength": 300},
+        "goal": {"type": "string", "minLength": 1, "maxLength": 12000},
+        "done_when": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 64,
+            "items": {"type": "string", "minLength": 1, "maxLength": 1000},
+        },
+        "kind": {
+            "type": "string",
+            "enum": ["implementation", "analysis", "delivery"],
+        },
+        "dependencies": {
+            "type": "array",
+            "maxItems": 64,
+            "items": {"type": "string", "minLength": 1, "maxLength": 80},
+        },
+        "workspace": WORKSPACE,
+        "base_sha": {"type": "string", "minLength": 7, "maxLength": 64},
+    },
+    "additionalProperties": False,
+}
+CAMPAIGN_RUBRIC_SCHEMA = {
+    "type": "object",
+    "required": ["scope", "behavior", "architecture", "tests", "operability"],
+    "properties": {
+        name: {"type": "integer", "minimum": 0, "maximum": 4}
+        for name in ("scope", "behavior", "architecture", "tests", "operability")
+    },
+    "additionalProperties": False,
+}
+
 
 def _annotations(title: str, *, read_only: bool, idempotent: bool) -> dict[str, Any]:
     return {
@@ -139,6 +189,263 @@ TOOLS: list[dict[str, Any]] = [
         },
         "annotations": _annotations(
             "Check Agent Harness runtime", read_only=True, idempotent=True
+        ),
+    },
+    {
+        "name": "create_campaign",
+        "description": (
+            "Freeze one local epic campaign with ordered tasks. Replay campaigns "
+            "also freeze a cutoff and the categories of historical evidence withheld "
+            "until the candidate is sealed. Does not read or change Jira or GitHub."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": [
+                "workspace",
+                "title",
+                "goal",
+                "done_when",
+                "source",
+                "tasks",
+            ],
+            "properties": {
+                "workspace": WORKSPACE,
+                "title": {"type": "string", "minLength": 1, "maxLength": 300},
+                "goal": {"type": "string", "minLength": 1, "maxLength": 12000},
+                "done_when": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 64,
+                    "items": {"type": "string", "minLength": 1, "maxLength": 1000},
+                },
+                "non_goals": {
+                    "type": "array",
+                    "maxItems": 64,
+                    "items": {"type": "string", "maxLength": 1000},
+                },
+                "constraints": {
+                    "type": "array",
+                    "maxItems": 64,
+                    "items": {"type": "string", "maxLength": 1000},
+                },
+                "forbidden_actions": {
+                    "type": "array",
+                    "maxItems": 64,
+                    "items": {"type": "string", "maxLength": 1000},
+                },
+                "risk": {"type": "string", "enum": ["low", "medium", "high"]},
+                "mode": {"type": "string", "enum": ["delivery", "replay"]},
+                "source": CAMPAIGN_SOURCE_SCHEMA,
+                "cutoff_at": {"type": "string", "minLength": 1, "maxLength": 64},
+                "tasks": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 64,
+                    "items": CAMPAIGN_TASK_SCHEMA,
+                },
+            },
+            "additionalProperties": False,
+        },
+        "annotations": _annotations(
+            "Create durable epic campaign", read_only=False, idempotent=False
+        ),
+    },
+    {
+        "name": "get_campaign",
+        "description": (
+            "Read one campaign contract, task progress, intervention summaries, "
+            "sealed candidate, and optional replay comparison."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["workspace", "campaign_id"],
+            "properties": {"workspace": WORKSPACE, "campaign_id": CAMPAIGN_ID},
+            "additionalProperties": False,
+        },
+        "annotations": _annotations(
+            "Read epic campaign", read_only=True, idempotent=True
+        ),
+    },
+    {
+        "name": "list_campaigns",
+        "description": "List recent local epic campaigns in this Git checkout.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["workspace"],
+            "properties": {
+                "workspace": WORKSPACE,
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+            },
+            "additionalProperties": False,
+        },
+        "annotations": _annotations(
+            "List epic campaigns", read_only=True, idempotent=True
+        ),
+    },
+    {
+        "name": "record_campaign_task",
+        "description": (
+            "Record one ordered campaign task transition. Completing an implementation "
+            "task requires a terminal complete v1 run from its repository."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["workspace", "campaign_id", "task_id", "status"],
+            "properties": {
+                "workspace": WORKSPACE,
+                "campaign_id": CAMPAIGN_ID,
+                "task_id": {"type": "string", "minLength": 1, "maxLength": 80},
+                "status": {
+                    "type": "string",
+                    "enum": [
+                        "in_progress",
+                        "complete",
+                        "needs_human",
+                        "blocked",
+                        "failed",
+                        "interrupted",
+                    ],
+                },
+                "summary": {"type": "string", "maxLength": 2000},
+                "run_workspace": WORKSPACE,
+                "run_id": RUN_ID,
+            },
+            "additionalProperties": False,
+        },
+        "annotations": _annotations(
+            "Record epic task progress", read_only=False, idempotent=True
+        ),
+    },
+    {
+        "name": "record_campaign_intervention",
+        "description": (
+            "Record one sanitized summary of human context, approval, correction, or "
+            "blocking question so autonomy can be measured without saving raw dialogue."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": [
+                "workspace",
+                "campaign_id",
+                "intervention_id",
+                "kind",
+                "reason",
+                "blocking",
+                "resolved",
+            ],
+            "properties": {
+                "workspace": WORKSPACE,
+                "campaign_id": CAMPAIGN_ID,
+                "intervention_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 80,
+                },
+                "kind": {
+                    "type": "string",
+                    "enum": ["blocking_question", "approval", "correction", "context"],
+                },
+                "reason": {"type": "string", "minLength": 1, "maxLength": 2000},
+                "outcome": {"type": "string", "maxLength": 2000},
+                "blocking": {"type": "boolean"},
+                "resolved": {"type": "boolean"},
+            },
+            "additionalProperties": False,
+        },
+        "annotations": _annotations(
+            "Record human intervention", read_only=False, idempotent=True
+        ),
+    },
+    {
+        "name": "seal_campaign_candidate",
+        "description": (
+            "Freeze the campaign's own result after every task completed and every "
+            "blocking intervention was resolved. Historical replay evidence remains "
+            "out of scope until this succeeds."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["workspace", "campaign_id", "summary"],
+            "properties": {
+                "workspace": WORKSPACE,
+                "campaign_id": CAMPAIGN_ID,
+                "summary": {"type": "string", "minLength": 1, "maxLength": 4000},
+            },
+            "additionalProperties": False,
+        },
+        "annotations": _annotations(
+            "Seal epic candidate", read_only=False, idempotent=True
+        ),
+    },
+    {
+        "name": "record_campaign_comparison",
+        "description": (
+            "After a replay candidate is sealed, record a bounded comparison against "
+            "historical Jira, PR, and Git evidence. Raw diffs and connector output "
+            "must not be supplied."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["workspace", "campaign_id", "rubric"],
+            "properties": {
+                "workspace": WORKSPACE,
+                "campaign_id": CAMPAIGN_ID,
+                "rubric": CAMPAIGN_RUBRIC_SCHEMA,
+                "similarities": {
+                    "type": "array",
+                    "maxItems": 64,
+                    "items": {"type": "string", "maxLength": 2000},
+                },
+                "differences": {
+                    "type": "array",
+                    "maxItems": 64,
+                    "items": {"type": "string", "maxLength": 2000},
+                },
+                "residual_risks": {
+                    "type": "array",
+                    "maxItems": 64,
+                    "items": {"type": "string", "maxLength": 2000},
+                },
+                "historical_refs": {
+                    "type": "array",
+                    "maxItems": 64,
+                    "items": {"type": "string", "maxLength": 1000},
+                },
+            },
+            "additionalProperties": False,
+        },
+        "annotations": _annotations(
+            "Record replay comparison", read_only=False, idempotent=True
+        ),
+    },
+    {
+        "name": "finish_campaign",
+        "description": (
+            "Finish a local epic campaign. Complete requires a sealed candidate and, "
+            "for replay, a historical comparison. It never authorizes external actions."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["workspace", "campaign_id", "status"],
+            "properties": {
+                "workspace": WORKSPACE,
+                "campaign_id": CAMPAIGN_ID,
+                "status": {
+                    "type": "string",
+                    "enum": [
+                        "complete",
+                        "needs_human",
+                        "blocked",
+                        "failed",
+                        "interrupted",
+                    ],
+                },
+                "summary": {"type": "string", "maxLength": 2000},
+            },
+            "additionalProperties": False,
+        },
+        "annotations": _annotations(
+            "Finish epic campaign", read_only=False, idempotent=True
         ),
     },
     {
@@ -416,6 +723,14 @@ class McpServer:
         self.service = service or HarnessService()
         self._handlers: dict[str, Callable[[Mapping[str, Any]], dict[str, Any]]] = {
             "check_runtime": self.service.check_runtime,
+            "create_campaign": self.service.create_campaign,
+            "get_campaign": self.service.get_campaign,
+            "list_campaigns": self.service.list_campaigns,
+            "record_campaign_task": self.service.record_campaign_task,
+            "record_campaign_intervention": self.service.record_campaign_intervention,
+            "seal_campaign_candidate": self.service.seal_campaign_candidate,
+            "record_campaign_comparison": self.service.record_campaign_comparison,
+            "finish_campaign": self.service.finish_campaign,
             "create_run": self.service.create_run,
             "get_run": self.service.get_run,
             "list_runs": self.service.list_runs,

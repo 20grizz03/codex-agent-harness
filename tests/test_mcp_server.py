@@ -13,6 +13,14 @@ from agent_harness.service import HarnessService
 
 EXPECTED_TOOLS = {
     "check_runtime",
+    "create_campaign",
+    "get_campaign",
+    "list_campaigns",
+    "record_campaign_task",
+    "record_campaign_intervention",
+    "seal_campaign_candidate",
+    "record_campaign_comparison",
+    "finish_campaign",
     "create_run",
     "get_run",
     "list_runs",
@@ -32,6 +40,14 @@ class McpContractTests(unittest.TestCase):
         for tool in TOOLS:
             self.assertFalse(tool["inputSchema"].get("additionalProperties", True))
             self.assertFalse(tool["annotations"]["destructiveHint"])
+
+    def test_mcp_allowlist_matches_public_tool_surface(self) -> None:
+        configuration = json.loads(
+            (_support.PLUGIN_ROOT / ".mcp.json").read_text(encoding="utf-8")
+        )
+        enabled = configuration["mcpServers"]["agent-harness"]["enabled_tools"]
+        self.assertEqual(EXPECTED_TOOLS, set(enabled))
+        self.assertEqual(len(EXPECTED_TOOLS), len(enabled))
 
     def test_initialize_and_tool_listing(self) -> None:
         server = McpServer(HarnessService({}))
@@ -67,6 +83,39 @@ class McpContractTests(unittest.TestCase):
                 "get_run", {"workspace": str(repo.path), "run_id": run_id}
             )
             self.assertEqual(run_id, fetched["structuredContent"]["state"]["run_id"])
+
+    def test_create_and_get_campaign_through_mcp(self) -> None:
+        with _support.TempRepo() as repo:
+            server = McpServer(HarnessService({}))
+            created = server.call_tool(
+                "create_campaign",
+                {
+                    "workspace": str(repo.path),
+                    "title": "Epic",
+                    "goal": "Deliver the epic",
+                    "done_when": ["The epic is complete"],
+                    "source": {"kind": "jira", "ref": "DEMO-1"},
+                    "tasks": [
+                        {
+                            "id": "T-1",
+                            "title": "Task",
+                            "goal": "Complete the task",
+                            "done_when": ["The task is complete"],
+                            "kind": "analysis",
+                        }
+                    ],
+                },
+            )
+            self.assertFalse(created["isError"])
+            campaign_id = created["structuredContent"]["contract"]["campaign_id"]
+            fetched = server.call_tool(
+                "get_campaign",
+                {"workspace": str(repo.path), "campaign_id": campaign_id},
+            )
+            self.assertEqual(
+                campaign_id,
+                fetched["structuredContent"]["state"]["campaign_id"],
+            )
 
     def test_stdio_entrypoint_speaks_json_rpc(self) -> None:
         requests = "\n".join(
