@@ -1,0 +1,6 @@
+interface:
+  display_name: "Agent Harness Review"
+  short_description: "Independent Claude review with Codex triage"
+  default_prompt: "Use $review to independently review the current repository changes."
+policy:
+  allow_implicit_invocation: true

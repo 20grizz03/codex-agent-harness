@@ -1,0 +1,38 @@
+{
+  "mcpServers": {
+    "agent-harness": {
+      "command": "python3",
+      "args": ["./scripts/mcp_server.py"],
+      "cwd": ".",
+      "env_vars": [
+        "PATH",
+        "AGENT_HARNESS_CLAUDE_BIN",
+        "AGENT_HARNESS_CLAUDE_MODEL",
+        "AGENT_HARNESS_TIMEOUT_SECONDS",
+        "AGENT_HARNESS_HEARTBEAT_SECONDS",
+        "AGENT_HARNESS_STALL_SECONDS",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_BASE_URL",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLAUDE_CODE_USE_FOUNDRY"
+      ],
+      "startup_timeout_sec": 10,
+      "tool_timeout_sec": 60,
+      "default_tools_approval_mode": "approve",
+      "enabled_tools": [
+        "check_runtime",
+        "create_run",
+        "get_run",
+        "list_runs",
+        "plan_checks",
+        "record_check",
+        "start_stage",
+        "poll_stage",
+        "cancel_stage",
+        "record_review_resolution",
+        "finish_run"
+      ]
+    }
+  }
+}

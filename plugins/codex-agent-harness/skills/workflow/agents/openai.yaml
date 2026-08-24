@@ -1,0 +1,6 @@
+interface:
+  display_name: "Agent Harness Workflow"
+  short_description: "Durable coding loop with independent review"
+  default_prompt: "Use $workflow to implement this repository change through durable checks and review."
+policy:
+  allow_implicit_invocation: true

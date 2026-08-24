@@ -1,0 +1,6 @@
+interface:
+  display_name: "Agent Harness Setup"
+  short_description: "Check Claude subscription runtime safely"
+  default_prompt: "Use $setup to check the local Claude runtime without invoking a model."
+policy:
+  allow_implicit_invocation: true
