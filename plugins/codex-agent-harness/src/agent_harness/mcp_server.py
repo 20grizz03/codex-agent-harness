@@ -21,7 +21,8 @@ SERVER_INSTRUCTIONS = (
     "tools start_stage, poll_stage, and cancel_stage are proxy-only: call them "
     "from one native tracking subagent, not from the user-facing lead. The "
     "critic profile is read-only. The implement profile requires explicit "
-    "Claude writer authority in the immutable run contract. Local completion "
+    "Claude writer authority in the immutable run contract. A confirmed "
+    "Anthropic critic limit permits one explicit Codex fallback review. Local completion "
     "does not authorize push, PR publication, tracker changes, deploys, or "
     "other external mutations."
 )
@@ -644,8 +645,9 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "record_review_resolution",
         "description": (
-            "Record Codex verification of critic findings. For an explicitly "
-            "Claude-written run, also accepts the independent Codex structured review."
+            "Record Codex verification of critic findings. Also accepts an independent "
+            "Codex review when Claude wrote the change, or one fresh Codex fallback "
+            "review after a confirmed Anthropic critic limit."
         ),
         "inputSchema": {
             "type": "object",

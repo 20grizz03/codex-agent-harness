@@ -138,6 +138,19 @@ if mode == "fail":
     print("api_key=super-secret-value", file=sys.stderr)
     print("not-json")
     raise SystemExit(7)
+if mode == "limit_stderr":
+    print("api_key=super-secret-value You've hit your usage limit", file=sys.stderr)
+    raise SystemExit(7)
+if mode == "limit_result":
+    print(json.dumps({{
+        "type": "result",
+        "subtype": "usage_cap_reached",
+        "is_error": True,
+        "result": "You've reached your subscription limit",
+    }}), flush=True)
+    raise SystemExit(1)
+if mode == "success_limit_warning":
+    print("The service is rate limiting your requests", file=sys.stderr)
 write_path = os.environ.get("FAKE_CLAUDE_WRITE_PATH")
 if write_path:
     Path(write_path).write_text(

@@ -130,6 +130,106 @@ class CodexWriterWorkflowTests(unittest.TestCase):
             )
             self.assertTrue(repeated["deduplicated"])
 
+    def test_confirmed_anthropic_limit_allows_one_codex_fallback_review(self) -> None:
+        with _support.TempRepo() as repo, tempfile.TemporaryDirectory() as directory:
+            service = self._service(
+                Path(directory), FAKE_CLAUDE_MODE="limit_result"
+            )
+            run_id = service.create_run(
+                {
+                    "workspace": str(repo.path),
+                    "goal": "Update docs",
+                    "done_when": ["Docs are current"],
+                }
+            )["contract"]["run_id"]
+            (repo.path / "README.md").write_text("changed\n", encoding="utf-8")
+            run_planned_checks(service, repo.path, run_id)
+            started = service.start_stage(
+                {
+                    "workspace": str(repo.path),
+                    "run_id": run_id,
+                    "profile": "critic",
+                }
+            )
+            terminal = wait_for_stage(
+                service, repo.path, run_id, started["stage_id"]
+            )
+            self.assertEqual("anthropic_limit", terminal["failure_kind"])
+            state = _support.wait_until(
+                lambda: (
+                    current
+                    if (
+                        current := service.get_run(
+                            {"workspace": str(repo.path), "run_id": run_id}
+                        )["state"]
+                    ).get("phase")
+                    == "reviewing"
+                    else None
+                )
+            )
+            self.assertIsNone(state["terminal"])
+
+            service.record_review_resolution(
+                {
+                    "workspace": str(repo.path),
+                    "run_id": run_id,
+                    "review": _support.PASS_REVIEW,
+                    "resolutions": [],
+                }
+            )
+            finished = service.finish_run(
+                {
+                    "workspace": str(repo.path),
+                    "run_id": run_id,
+                    "status": "complete",
+                }
+            )
+            self.assertEqual("complete", finished["phase"])
+            persisted = service.get_run(
+                {"workspace": str(repo.path), "run_id": run_id}
+            )
+            self.assertEqual(
+                "codex_fallback", persisted["review"]["review"]["origin"]
+            )
+            critic = next(iter(persisted["state"]["stages"].values()))
+            self.assertEqual("anthropic_limit", critic["failure_kind"])
+
+    def test_generic_critic_failure_does_not_enable_fallback(self) -> None:
+        with _support.TempRepo() as repo, tempfile.TemporaryDirectory() as directory:
+            service = self._service(Path(directory), FAKE_CLAUDE_MODE="fail")
+            run_id = service.create_run(
+                {
+                    "workspace": str(repo.path),
+                    "goal": "Update docs",
+                    "done_when": ["Docs are current"],
+                }
+            )["contract"]["run_id"]
+            (repo.path / "README.md").write_text("changed\n", encoding="utf-8")
+            run_planned_checks(service, repo.path, run_id)
+            started = service.start_stage(
+                {
+                    "workspace": str(repo.path),
+                    "run_id": run_id,
+                    "profile": "critic",
+                }
+            )
+            wait_for_stage(service, repo.path, run_id, started["stage_id"])
+            _support.wait_until(
+                lambda: service.get_run(
+                    {"workspace": str(repo.path), "run_id": run_id}
+                )["state"]["phase"]
+                == "failed"
+            )
+            with self.assertRaises(StateError):
+                service.record_review_resolution(
+                    {
+                        "workspace": str(repo.path),
+                        "run_id": run_id,
+                        "review": _support.PASS_REVIEW,
+                        "resolutions": [],
+                    }
+                )
+
     def test_failed_gate_prevents_review(self) -> None:
         with _support.TempRepo() as repo, tempfile.TemporaryDirectory() as directory:
             service = self._service(Path(directory))
@@ -217,8 +317,27 @@ class CodexWriterWorkflowTests(unittest.TestCase):
                 )["review"]["review"]
             )
 
+            first_resolution = service.record_review_resolution(
+                {
+                    "workspace": str(repo.path),
+                    "run_id": run_id,
+                    "resolutions": [
+                        {
+                            "finding_id": "F-1",
+                            "disposition": "accepted",
+                            "resolved": False,
+                            "evidence": "README.md contradicts the contract",
+                        }
+                    ],
+                }
+            )
+            self.assertEqual("correcting", first_resolution["phase"])
             (repo.path / "README.md").write_text("correct behavior\n", encoding="utf-8")
-            service.record_review_resolution(
+            second_plan = run_planned_checks(service, repo.path, run_id)
+            self.assertNotEqual(
+                first_plan["diff_fingerprint"], second_plan["diff_fingerprint"]
+            )
+            final_resolution = service.record_review_resolution(
                 {
                     "workspace": str(repo.path),
                     "run_id": run_id,
@@ -232,10 +351,7 @@ class CodexWriterWorkflowTests(unittest.TestCase):
                     ],
                 }
             )
-            second_plan = run_planned_checks(service, repo.path, run_id)
-            self.assertNotEqual(
-                first_plan["diff_fingerprint"], second_plan["diff_fingerprint"]
-            )
+            self.assertEqual("reviewing", final_resolution["phase"])
             state = service.get_run(
                 {"workspace": str(repo.path), "run_id": run_id}
             )["state"]

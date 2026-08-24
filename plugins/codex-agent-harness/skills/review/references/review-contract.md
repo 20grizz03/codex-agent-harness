@@ -14,3 +14,5 @@ The structured result contains:
 Ignore style preferences without concrete impact. Do not report a finding based only on a failing check already present in the supplied evidence. P0 and P1 require a reproducible path or direct code evidence.
 
 Codex independently traces each finding through surrounding production code and tests. Merge duplicates, reject unsupported claims with contrary evidence, and keep `unverified` findings unresolved. A passing Claude verdict does not override a failed deterministic check.
+
+The only degraded reviewer is a fresh read-only native Codex subagent after the persisted Claude stage reports `failure_kind: anthropic_limit`. It follows this same contract, reads Git directly, and is stored with origin `codex_fallback`. Do not reinterpret a generic provider error as a limit and do not hide the fallback origin from the user.

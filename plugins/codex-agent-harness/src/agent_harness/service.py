@@ -150,6 +150,16 @@ class HarnessService:
                     missing_or_failed.append(name)
         return bool(planned) and not missing_or_failed, missing_or_failed
 
+    @staticmethod
+    def _codex_fallback_allowed(state: Mapping[str, Any]) -> bool:
+        return any(
+            isinstance(stage, dict)
+            and stage.get("profile") == "critic"
+            and stage.get("lifecycle_state") == "failed"
+            and stage.get("failure_kind") == "anthropic_limit"
+            for stage in state.get("stages", {}).values()
+        )
+
     def check_runtime(self, _arguments: Mapping[str, Any] | None = None) -> dict[str, Any]:
         return claude_runtime.check_runtime(self._effective_environ())
 
@@ -1066,6 +1076,8 @@ class HarnessService:
                     stage["error"] = sanitize_text(
                         terminal.get("error"), maximum=1_000
                     )
+                if terminal.get("failure_kind") == "anthropic_limit":
+                    stage["failure_kind"] = "anthropic_limit"
                 profile = stage.get("profile")
                 if lifecycle == "completed" and profile == "critic":
                     review_value = terminal.get("result")
@@ -1096,6 +1108,12 @@ class HarnessService:
                         "at": utc_now(),
                         "summary": "Claude stage was interrupted",
                     }
+                elif (
+                    lifecycle == "failed"
+                    and profile == "critic"
+                    and stage.get("failure_kind") == "anthropic_limit"
+                ):
+                    self._transition(state, "reviewing")
                 else:
                     self._transition(state, "failed")
                     state["terminal"] = {
@@ -1104,15 +1122,15 @@ class HarnessService:
                         "summary": stage.get("error", "Claude stage failed"),
                     }
                 store.save_state(run_id, state)
-                store.append_event(
-                    run_id,
-                    {
-                        "type": "stage_persisted",
-                        "stage_id": stage_id,
-                        "profile": profile,
-                        "lifecycle_state": lifecycle,
-                    },
-                )
+                event = {
+                    "type": "stage_persisted",
+                    "stage_id": stage_id,
+                    "profile": profile,
+                    "lifecycle_state": lifecycle,
+                }
+                if stage.get("failure_kind") == "anthropic_limit":
+                    event["failure_kind"] = "anthropic_limit"
+                store.append_event(run_id, event)
         except (InputError, StateError, OSError):
             return
 
@@ -1401,14 +1419,34 @@ class HarnessService:
                 elif supplied_review is not None:
                     raise StateError("independent review is already recorded")
             else:
-                if supplied_review is not None:
+                fallback_allowed = self._codex_fallback_allowed(state)
+                if review is None and supplied_review is not None and fallback_allowed:
+                    review = {
+                        **validate_review(supplied_review, origin="codex_fallback"),
+                        "diff_fingerprint": state.get("diff_fingerprint"),
+                        "recorded_at": utc_now(),
+                    }
+                    review_file["review"] = review
+                elif supplied_review is not None:
                     raise InputError(
-                        "Codex-written runs use the persisted Claude critic result"
+                        "a Codex fallback review is accepted only after a confirmed "
+                        "Anthropic usage limit"
                     )
-                if not isinstance(review, dict):
+                elif not isinstance(review, dict):
+                    if fallback_allowed:
+                        raise StateError(
+                            "a fresh Codex fallback review must be supplied"
+                        )
                     raise StateError("Claude critic review is not complete")
 
-            if review.get("diff_fingerprint") != state.get("diff_fingerprint"):
+            correction_review = (
+                int(state.get("correction_passes", 0)) > 0
+                and state.get("phase") in ("checking", "reviewing")
+            )
+            if (
+                review.get("diff_fingerprint") != state.get("diff_fingerprint")
+                and not correction_review
+            ):
                 raise StateError("review does not describe the current diff fingerprint")
             finding_ids = {
                 finding["id"]
@@ -1429,9 +1467,11 @@ class HarnessService:
                 "finding_count": len(finding_ids),
                 "blocking_question": bool(review.get("blocking_question")),
                 "diff_fingerprint": review.get("diff_fingerprint"),
+                "resolution_diff_fingerprint": state.get("diff_fingerprint"),
             }
-            accepted = any(
+            accepted_unresolved = any(
                 item.get("disposition") == "accepted"
+                and item.get("resolved") is not True
                 for item in stored_resolutions.values()
                 if isinstance(item, dict)
             )
@@ -1461,7 +1501,7 @@ class HarnessService:
                     "at": utc_now(),
                     "summary": "Unresolved P0/P1 findings require human attention",
                 }
-            elif accepted:
+            elif accepted_unresolved:
                 self._transition(state, "correcting")
             else:
                 self._transition(state, "reviewing")
@@ -1500,8 +1540,24 @@ class HarnessService:
         if not isinstance(review, dict):
             blockers.append("independent review is missing")
             return blockers
-        expected_origin = "claude" if contract.get("writer") == "codex" else "codex"
-        if review.get("origin") != expected_origin:
+        origin = review.get("origin")
+        if contract.get("writer") == "codex":
+            if origin == "claude":
+                critic = [
+                    stage
+                    for stage in state.get("stages", {}).values()
+                    if isinstance(stage, dict) and stage.get("profile") == "critic"
+                ]
+                if not critic or critic[0].get("lifecycle_state") != "completed":
+                    blockers.append("Claude critic stage is not complete")
+            elif origin == "codex_fallback":
+                if not self._codex_fallback_allowed(state):
+                    blockers.append(
+                        "Codex fallback review lacks a confirmed Anthropic usage limit"
+                    )
+            else:
+                blockers.append("review origin is not allowed for a Codex writer")
+        elif origin != "codex":
             blockers.append("review origin is not independent from the writer")
         if (
             review.get("diff_fingerprint") != current
@@ -1521,15 +1577,7 @@ class HarnessService:
                 blockers.append(f"finding {finding_id} remains unverified")
             elif resolution.get("resolved") is not True:
                 blockers.append(f"finding {finding_id} is not resolved")
-        if contract.get("writer") == "codex":
-            critic = [
-                stage
-                for stage in state.get("stages", {}).values()
-                if isinstance(stage, dict) and stage.get("profile") == "critic"
-            ]
-            if not critic or critic[0].get("lifecycle_state") != "completed":
-                blockers.append("Claude critic stage is not complete")
-        else:
+        if contract.get("writer") != "codex":
             implement = [
                 stage
                 for stage in state.get("stages", {}).values()

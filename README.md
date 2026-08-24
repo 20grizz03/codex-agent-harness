@@ -1,10 +1,10 @@
 # Codex Agent Harness
 
-`codex-agent-harness` is a local Codex plugin for durable repository-changing tasks and multi-task epic campaigns. Codex records immutable contracts, runs deterministic checks through its normal sandbox, obtains one fresh independent Claude review per implementation run, and completes only against evidence tied to the current diff.
+`codex-agent-harness` is a local Codex plugin for durable repository-changing tasks and multi-task epic campaigns. Codex records immutable contracts, runs deterministic checks through its normal sandbox, obtains one fresh independent review per implementation run, and completes only against evidence tied to the current diff.
 
 The plugin includes delivery-writing conventions: compact Jira tasks, post-implementation testing recommendations, one- or two-sentence PR descriptions, natural Russian technical prose, and concise colleague-facing review comments. Drafting text does not authorize changing Jira or publishing to GitHub.
 
-Version 2.1 can read Jira epics and GitHub Enterprise delivery state through connectors already available to Codex. It deliberately does not embed tracker clients, balance subscriptions, compare providers, run a daemon, write external state without approval, or fall back to another model.
+Version 2.1 can read Jira epics and GitHub Enterprise delivery state through connectors already available to Codex. It can run two dependency-free tasks in parallel when they use different repositories. Every task keeps its own review. Claude remains the default critic; only a confirmed Anthropic usage limit permits one fresh read-only Codex fallback review, recorded explicitly as `codex_fallback`. Other Claude failures do not trigger retries or fallback.
 
 ## Skills
 

@@ -190,6 +190,28 @@ class ManagedStageTests(unittest.TestCase):
             self.assertGreater(terminal["telemetry"]["provider_stderr_chars"], 0)
             self.assertGreater(terminal["telemetry"]["invalid_lines"], 0)
 
+    def test_anthropic_limit_is_classified_without_exposing_provider_text(self) -> None:
+        for mode in ("limit_stderr", "limit_result"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                stage, events, terminals = self._stage(Path(directory), mode=mode)
+                terminal = _support.wait_until(
+                    lambda: stage.poll().get("terminal")
+                )
+                self.assertEqual("failed", terminal["lifecycle_state"])
+                self.assertEqual("anthropic_limit", terminal["failure_kind"])
+                self.assertEqual("Anthropic usage limit reached", terminal["error"])
+                rendered = repr(events) + repr(terminals)
+                self.assertNotIn("super-secret-value", rendered)
+                self.assertNotIn("subscription limit", rendered)
+
+    def test_limit_warning_does_not_override_a_successful_review(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            stage, _events, _terminals = self._stage(
+                Path(directory), mode="success_limit_warning"
+            )
+            terminal = _support.wait_until(lambda: stage.poll().get("terminal"))
+            self.assertEqual("completed", terminal["lifecycle_state"])
+
     def test_quality_floor_violation_fails_stage(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             stage, _events, _terminals = self._stage(

@@ -38,6 +38,8 @@ The server binds check results to the current diff fingerprint. Any later edit m
 
 For a Codex-written change, delegate one `critic` stage to a fresh native tracking subagent. The proxy calls `start_stage`, polls with `poll_stage`, and cancels only when asked or when the task is abandoned. Claude reads the repository and Git directly; do not paste the diff into its prompt.
 
+Do not retry the Claude stage. If and only if its terminal state contains `failure_kind: anthropic_limit`, delegate the same read-only review contract to one fresh native Codex subagent with no inherited task conversation. It must inspect the repository and Git itself. Supply its structured result to `record_review_resolution`; the server records origin `codex_fallback`. This degraded path may close the local run, but must be disclosed in the result. A timeout, authentication problem, process failure, invalid output, cancellation, or quality-floor violation never enables fallback.
+
 Codex verifies every returned finding against the code and records dispositions with `record_review_resolution`:
 
 - `accepted`: the finding is valid; set `resolved: true` only after the correction exists.
@@ -48,7 +50,7 @@ If Claude wrote the change, Codex performs the independent review and supplies t
 
 ## 6. One correction and completion
 
-At most one correction pass is allowed. After an accepted finding is fixed, call `plan_checks` again and rerun every required check for the new fingerprint. Do not launch a second Claude critic in v1.
+At most one correction pass is allowed. First record an accepted finding with `resolved: false`, then fix it, call `plan_checks` again, and rerun every required check for the new fingerprint. Finally update that finding to `resolved: true` against the checked correction. Do not launch a second critic.
 
 Call `finish_run` with `complete` only when the server confirms that current checks pass, an independent review exists, all findings are resolved, and no blocking question remains. Use `needs_human` for scope expansion, unresolved P0/P1 findings, dirty-file ownership, or a required user decision. Use `blocked`, `failed`, or `interrupted` only for their literal terminal conditions.
 

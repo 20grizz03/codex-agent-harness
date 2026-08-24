@@ -51,6 +51,24 @@ REQUIRED_FLAGS = (
     "--disallowedTools",
 )
 SAFE_LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,127}$")
+ANTHROPIC_LIMIT_LABELS = {
+    "quota_exceeded",
+    "quota_reached",
+    "rate_limit",
+    "rate_limit_error",
+    "rate_limited",
+    "usage_cap_reached",
+    "usage_limit_reached",
+}
+ANTHROPIC_LIMIT_TEXT_RE = re.compile(
+    r"(?:"
+    r"\byou(?:'ve| have)\s+(?:hit|reached)\s+(?:your\s+)?[^\r\n]{0,40}\blimit\b"
+    r"|\b(?:rate|usage|credit)\s+limit\s+(?:has\s+been\s+|is\s+)?(?:reached|exceeded)\b"
+    r"|\bquota\s+(?:has\s+been\s+|is\s+)?(?:reached|exceeded)\b"
+    r"|\brate limiting your requests\b"
+    r")",
+    re.IGNORECASE,
+)
 
 SANDBOX_SETTINGS = {
     "sandbox": {
@@ -316,6 +334,24 @@ def _safe_label(value: Any) -> str | None:
     return normalized if SAFE_LABEL_RE.fullmatch(normalized) else None
 
 
+def _is_anthropic_limit(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    label = value.strip().casefold().replace("-", "_").replace(" ", "_")
+    return label in ANTHROPIC_LIMIT_LABELS or bool(
+        ANTHROPIC_LIMIT_TEXT_RE.search(value)
+    )
+
+
+def _result_is_anthropic_limit(payload: Mapping[str, Any] | None) -> bool:
+    if not isinstance(payload, Mapping):
+        return False
+    return any(
+        _is_anthropic_limit(payload.get(key))
+        for key in ("subtype", "error_type", "code", "result", "error", "message")
+    )
+
+
 def _actual_models(payload: Mapping[str, Any]) -> list[str]:
     candidates: list[str] = []
     direct = _safe_label(payload.get("model"))
@@ -379,6 +415,8 @@ class ManagedStage:
         self._cancelled = False
         self._timed_out = False
         self._result_payload: dict[str, Any] | None = None
+        self._failure_kind: str | None = None
+        self._stderr_scan_tail = ""
         self._stdout_chars = 0
         self._stderr_chars = 0
         self._invalid_lines = 0
@@ -525,6 +563,10 @@ class ManagedStage:
             return
         for chunk in iter(lambda: self.process.stderr.read(4096), ""):
             self._stderr_chars += len(chunk)
+            scanned = self._stderr_scan_tail + chunk
+            if self._failure_kind is None and _is_anthropic_limit(scanned):
+                self._failure_kind = "anthropic_limit"
+            self._stderr_scan_tail = scanned[-256:]
 
     def _terminal_from_result(self, returncode: int) -> dict[str, Any]:
         elapsed_ms = int((time.monotonic() - self._started_monotonic) * 1_000)
@@ -548,6 +590,23 @@ class ManagedStage:
             return {
                 "lifecycle_state": "failed",
                 "error": "Claude stage timed out",
+                "telemetry": telemetry,
+            }
+        result_is_error = bool(
+            isinstance(self._result_payload, Mapping)
+            and self._result_payload.get("is_error") is True
+        )
+        if (
+            returncode != 0 and self._failure_kind == "anthropic_limit"
+        ) or (
+            (returncode != 0 or result_is_error)
+            and _result_is_anthropic_limit(self._result_payload)
+        ):
+            return {
+                "lifecycle_state": "failed",
+                "failure_kind": "anthropic_limit",
+                "error": "Anthropic usage limit reached",
+                "returncode": returncode,
                 "telemetry": telemetry,
             }
         if returncode != 0 or self._result_payload is None:
@@ -625,6 +684,7 @@ class ManagedStage:
             }
             public_terminal = dict(self._terminal)
         self._result_payload = None
+        self._stderr_scan_tail = ""
         self._terminal_ready.set()
         self._emit(
             {

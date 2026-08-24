@@ -14,6 +14,8 @@ The lifecycle is `prepared → writing → checking → reviewing → correcting
 
 ## Review
 
-The default stage is a read-only Claude Opus critic using a fresh context and repository-native Git inspection. It receives the task contract and check evidence, not a pasted diff. Claude returns a strict JSON result. Codex verifies each finding and may perform one correction pass; checks are invalidated whenever the diff fingerprint changes.
+The default stage is a read-only Claude Opus critic using a fresh context and repository-native Git inspection. It receives the task contract and check evidence, not a pasted diff. Claude returns a strict JSON result. Codex verifies each finding and may perform one correction pass; checks are invalidated whenever the diff fingerprint changes. Resolutions from that review may be updated after the corrected diff passes its own checks without launching a second critic.
+
+If the Claude process reports a recognized Anthropic usage-limit code or message, the failed stage stores only `failure_kind: anthropic_limit`. The run stays in `reviewing` and may accept one fresh read-only native Codex review with origin `codex_fallback`. Raw provider text is discarded. Timeouts, authentication failures, process errors, invalid structured output, cancellation, and quality-floor violations do not enable this path.
 
 Claude can be the writer only when the immutable contract records explicit user intent. In that mode Codex supplies the independent structured review, so the same provider never acts as both writer and critic.
