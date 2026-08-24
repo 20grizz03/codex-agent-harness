@@ -4,7 +4,7 @@
 
 The plugin includes delivery-writing conventions: compact Jira tasks, post-implementation testing recommendations, one- or two-sentence PR descriptions, natural Russian technical prose, and concise colleague-facing review comments. Drafting text does not authorize changing Jira or publishing to GitHub.
 
-Version 2.1 can read Jira epics and GitHub Enterprise delivery state through connectors already available to Codex. It can run two dependency-free tasks in parallel when they use different repositories. Every task keeps its own review. Claude remains the default critic; only a confirmed Anthropic usage limit permits one fresh read-only Codex fallback review, recorded explicitly as `codex_fallback`. Other Claude failures do not trigger retries or fallback.
+Version 2.1 can read Jira epics and GitHub Enterprise delivery state through connectors already available to Codex. It can assign up to three dependency-free tasks to separate Codex subagents, including a terminal same-repository task group isolated in worktrees; a dedicated integration task rechecks and reviews their combined result. Every task keeps its own review. Claude remains the default critic; only a confirmed Anthropic usage limit permits one fresh read-only Codex fallback review, recorded explicitly as `codex_fallback`. Other Claude failures do not trigger retries or fallback.
 
 ## Skills
 

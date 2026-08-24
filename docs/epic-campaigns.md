@@ -2,7 +2,7 @@
 
 Version 2.1 adds a local campaign above the existing v1 run. A campaign orders several implementation, analysis, or delivery tasks without adding a scheduler: Codex uses its native plan and calls the existing v1 workflow for every repository-changing task.
 
-Tasks for one repository accumulate without intermediate commits in one isolated campaign worktree. Later v1 runs may acknowledge that worktree as dirty only after its paths are verified as outputs of earlier completed campaign tasks. Dependency-free tasks may use at most two parallel streams when their repositories differ; tasks in one repository remain serial and every task keeps a separate v1 review. The candidate is sealed before local commits.
+Codex coordinates the campaign and assigns each ready implementation task to a separate native subagent, with at most three task executors active at once. Sequential same-repository tasks accumulate without intermediate commits in one integration worktree. A terminal group of dependency-free tasks may also run from the same base SHA in separate worktrees when their expected paths do not overlap. Each task commits before its final v1 checks and review. A predeclared integration run freezes the source commit SHAs, verifies their Git ancestry, and runs the full v1 checks and review again. The candidate is sealed after integration and before any further edits.
 
 ## State
 
