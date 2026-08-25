@@ -270,6 +270,16 @@ def runtime_timing(environ: Mapping[str, str]) -> tuple[int, int, int]:
     return timeout, heartbeat, stall
 
 
+def anthropic_cooldown_seconds(environ: Mapping[str, str]) -> int:
+    return _bounded_seconds(
+        environ,
+        "AGENT_HARNESS_ANTHROPIC_COOLDOWN_SECONDS",
+        3600,
+        1,
+        14_400,
+    )
+
+
 def build_command(
     claude_bin: str,
     *,

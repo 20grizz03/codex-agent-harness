@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import os
 import threading
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -14,11 +16,12 @@ from .campaign import (
     TASK_STATUSES,
     CampaignStore,
     build_campaign,
+    verify_openspec_reference,
 )
 from .claude_runtime import ManagedStage
 from .contract import build_contract
-from .git_repo import diff_fingerprint, resolve_repo
-from .policy import plan_checks as build_check_plan
+from .git_repo import diff_fingerprint, resolve_repo, status_snapshot
+from .policy import RISK_RANK, plan_checks as build_check_plan, validate_risk
 from .review import build_stage_prompt, validate_review
 from .store import RunStore, SCHEMA_VERSION
 from .util import (
@@ -39,6 +42,37 @@ TERMINAL_PHASES = {
     "interrupted",
 }
 RESOLUTION_VALUES = {"accepted", "rejected", "unverified"}
+
+
+def _runtime_version() -> str:
+    manifest = Path(__file__).resolve().parents[2] / ".codex-plugin" / "plugin.json"
+    try:
+        value = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return "unknown"
+    version = value.get("version") if isinstance(value, dict) else None
+    return version if isinstance(version, str) and version else "unknown"
+
+
+def _runtime_version_order(value: str) -> tuple[int, int, int, int] | None:
+    release, separator, build = value.partition("+codex.")
+    parts = release.split(".")
+    if len(parts) != 3 or not all(part.isdigit() for part in parts):
+        return None
+    if separator and (len(build) != 14 or not build.isdigit()):
+        return None
+    major, minor, patch = (int(part) for part in parts)
+    return major, minor, patch, int(build or "0")
+
+
+def _parse_timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed.astimezone(UTC) if parsed.tzinfo else None
 
 
 class HarnessService:
@@ -95,6 +129,7 @@ class HarnessService:
         self, store: RunStore, run_id: str, state: dict[str, Any]
     ) -> dict[str, Any]:
         changed = False
+        interrupted_stage_ids: list[str] = []
         for stage_id, stage in state.get("stages", {}).items():
             if stage.get("lifecycle_state") != "running":
                 continue
@@ -104,6 +139,7 @@ class HarnessService:
             stage["finished_at"] = utc_now()
             stage["error"] = "MCP server restarted during model inference"
             changed = True
+            interrupted_stage_ids.append(stage_id)
         if changed:
             self._transition(state, "interrupted")
             state["terminal"] = {
@@ -119,6 +155,14 @@ class HarnessService:
                     "reason": "server_restart_during_inference",
                 },
             )
+            contract = store.read_contract(run_id)
+            for stage_id in interrupted_stage_ids:
+                self._record_campaign_provider_terminal(
+                    contract,
+                    run_id,
+                    stage_id,
+                    {"lifecycle_state": "interrupted"},
+                )
         return state
 
     @staticmethod
@@ -163,12 +207,170 @@ class HarnessService:
     def check_runtime(self, _arguments: Mapping[str, Any] | None = None) -> dict[str, Any]:
         return claude_runtime.check_runtime(self._effective_environ())
 
+    def _prepare_campaign_run(
+        self,
+        arguments: dict[str, Any],
+        context: Any,
+    ) -> dict[str, Any] | None:
+        raw = arguments.get("campaign")
+        if raw is None:
+            return None
+        if not isinstance(raw, Mapping) or set(raw) != {
+            "workspace",
+            "campaign_id",
+            "task_id",
+        }:
+            raise InputError(
+                "campaign must contain exactly workspace, campaign_id, and task_id"
+            )
+        campaign_workspace = require_string(
+            raw.get("workspace"), "campaign.workspace", maximum=4_096
+        )
+        campaign_id = require_string(
+            raw.get("campaign_id"), "campaign.campaign_id", maximum=128
+        )
+        task_id = require_string(
+            raw.get("task_id"), "campaign.task_id", maximum=80
+        )
+        store = CampaignStore.for_workspace(campaign_workspace)
+        campaign_contract = store.read_contract(campaign_id)
+        campaign_state = store.read_state(campaign_id)
+        self._require_campaign_open(campaign_state)
+        definition = self._campaign_task_definition(campaign_contract, task_id)
+        if definition.get("kind") != "implementation":
+            raise StateError("campaign-linked run requires an implementation task")
+        task_state = campaign_state.get("tasks", {}).get(task_id)
+        if not isinstance(task_state, dict) or task_state.get("status") != "in_progress":
+            raise StateError(
+                "campaign task must be in_progress before its run is created"
+            )
+        expected_workspace = definition.get("workspace")
+        if not isinstance(expected_workspace, str) or (
+            Path(expected_workspace).resolve() != context.repo_root
+        ):
+            raise StateError("campaign task workspace does not match run workspace")
+
+        base_from_task = definition.get("base_from_task")
+        if isinstance(base_from_task, str):
+            predecessor = campaign_state.get("tasks", {}).get(base_from_task)
+            predecessor_run = (
+                predecessor.get("run") if isinstance(predecessor, dict) else None
+            )
+            expected_base = (
+                predecessor_run.get("head_sha")
+                if isinstance(predecessor_run, dict)
+                else None
+            )
+            if not isinstance(expected_base, str):
+                raise StateError(
+                    "base_from_task requires a completed committed predecessor"
+                )
+        else:
+            expected_base = definition.get("base_sha")
+        if not isinstance(expected_base, str):
+            raise StateError("campaign task has no resolved base_sha")
+        supplied_base = arguments.get("base_sha")
+        if isinstance(supplied_base, str) and not expected_base.lower().startswith(
+            supplied_base.lower()
+        ) and not supplied_base.lower().startswith(expected_base.lower()):
+            raise InputError("run base_sha conflicts with the campaign task")
+        arguments["base_sha"] = expected_base
+
+        campaign_risk = validate_risk(campaign_contract.get("risk", "high"))
+        requested_risk = validate_risk(arguments.get("risk", "medium"))
+        if RISK_RANK[requested_risk] < RISK_RANK[campaign_risk]:
+            arguments["risk"] = campaign_risk
+        return {
+            "reference": {
+                "workspace": str(store.context.repo_root),
+                "campaign_id": campaign_id,
+                "task_id": task_id,
+            },
+            "store": store,
+            "contract": campaign_contract,
+            "state": campaign_state,
+        }
+
+    def _adopt_campaign_runtime(
+        self,
+        store: CampaignStore,
+        contract: Mapping[str, Any],
+        _state: Mapping[str, Any],
+        task_id: str,
+        version: str,
+    ) -> None:
+        campaign_id = require_string(
+            contract.get("campaign_id"), "campaign_id", maximum=128
+        )
+        state = store.read_state(campaign_id)
+        history = state.setdefault("runtime_versions", [])
+        if not isinstance(history, list):
+            raise StateError("campaign runtime version history is corrupt")
+        current = history[-1].get("version") if history else contract.get(
+            "runtime_version"
+        )
+        if current == version:
+            return
+        if version == "unknown":
+            raise StateError("campaign plugin runtime version is unknown")
+        current_order = (
+            _runtime_version_order(current) if isinstance(current, str) else None
+        )
+        version_order = _runtime_version_order(version)
+        if (
+            current_order is not None
+            and version_order is not None
+            and version_order < current_order
+        ):
+            raise StateError("campaign plugin runtime cannot be downgraded")
+        tasks = state.get("tasks", {})
+        active = [
+            other_id
+            for other_id, task in tasks.items()
+            if other_id != task_id
+            and isinstance(task, dict)
+            and task.get("status") == "in_progress"
+        ]
+        circuit = state.get("provider_circuits", {}).get("anthropic", {})
+        if active or (isinstance(circuit, dict) and circuit.get("probe")):
+            raise StateError(
+                "plugin runtime may change only between task waves with no active probe"
+            )
+        entry = {
+            "version": version,
+            "at": utc_now(),
+            "reason": (
+                "safe_upgrade"
+                if current_order is not None and version_order is not None
+                else "safe_checkpoint_unordered"
+            ),
+        }
+        history.append(entry)
+        store.save_state(campaign_id, state)
+        store.append_event(
+            campaign_id,
+            {"type": "runtime_version_adopted", "version": version},
+        )
+
     def create_run(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
         workspace = self._workspace(arguments)
         context = resolve_repo(workspace)
-        contract, state = build_contract(dict(arguments), context)
+        normalized = dict(arguments)
+        parent = self._prepare_campaign_run(normalized, context)
+        contract, state = build_contract(normalized, context)
+        contract["runtime_version"] = _runtime_version()
+        if parent is not None:
+            contract["campaign"] = parent["reference"]
         store = RunStore(context)
         with self._lock:
+            if parent is not None:
+                self._adopt_campaign_runtime(
+                    parent["store"],
+                    parent["contract"],
+                    parent["state"],
+                    parent["reference"]["task_id"],
+                    contract["runtime_version"],
+                )
             store.create(contract, state)
             store.append_event(
                 contract["run_id"],
@@ -244,6 +446,11 @@ class HarnessService:
         workspace = self._workspace(arguments)
         context = resolve_repo(workspace)
         contract, state = build_campaign(dict(arguments), context)
+        version = _runtime_version()
+        contract["runtime_version"] = version
+        state["runtime_versions"] = [
+            {"version": version, "at": state["created_at"], "reason": "created"}
+        ]
         store = CampaignStore(context)
         with self._lock:
             store.create(contract, state)
@@ -323,6 +530,8 @@ class HarnessService:
         definition: Mapping[str, Any],
         task_states: Mapping[str, Any],
         task_id: str,
+        campaign_contract: Mapping[str, Any],
+        campaign_id: str,
     ) -> dict[str, Any]:
         run_store = RunStore.for_workspace(workspace)
         run_contract = run_store.read_contract(run_id)
@@ -347,7 +556,19 @@ class HarnessService:
                 "v1 run workspace does not match the campaign task contract"
             )
 
-        expected_base = definition.get("base_sha")
+        base_from_task = definition.get("base_from_task")
+        if isinstance(base_from_task, str):
+            predecessor = task_states.get(base_from_task)
+            predecessor_run = (
+                predecessor.get("run") if isinstance(predecessor, dict) else None
+            )
+            expected_base = (
+                predecessor_run.get("head_sha")
+                if isinstance(predecessor_run, dict)
+                else None
+            )
+        else:
+            expected_base = definition.get("base_sha")
         actual_base = run_contract.get("base_sha")
         if not isinstance(expected_base, str) or not isinstance(actual_base, str):
             raise StateError("campaign task and v1 run require a base_sha")
@@ -355,6 +576,18 @@ class HarnessService:
             raise StateError(
                 "v1 run base_sha does not match the campaign task contract"
             )
+
+        campaign_risk = validate_risk(campaign_contract.get("risk", "high"))
+        run_risk = validate_risk(run_state.get("risk"), "v1 run risk")
+        if RISK_RANK[run_risk] < RISK_RANK[campaign_risk]:
+            raise StateError("v1 run risk is lower than campaign risk")
+
+        parent = run_contract.get("campaign")
+        if isinstance(parent, Mapping) and (
+            parent.get("campaign_id") != campaign_id
+            or parent.get("task_id") != task_id
+        ):
+            raise StateError("v1 run is linked to another campaign task")
 
         for other_task_id, other_state in task_states.items():
             if other_task_id == task_id or not isinstance(other_state, dict):
@@ -368,12 +601,29 @@ class HarnessService:
         fingerprint = run_state.get("diff_fingerprint")
         if not isinstance(fingerprint, str):
             raise StateError("completed v1 run is missing its diff fingerprint")
+        head_sha = run_store.context.head_sha
+        is_predecessor = any(
+            isinstance(task, Mapping)
+            and task.get("base_from_task") == task_id
+            for task in campaign_contract.get("tasks", [])
+        )
+        if is_predecessor:
+            if status_snapshot(run_store.context).get("dirty"):
+                raise StateError(
+                    "a base_from_task predecessor must end in a clean atomic commit"
+                )
+            if head_sha == actual_base:
+                raise StateError(
+                    "a base_from_task predecessor must advance HEAD with a commit"
+                )
         return {
             "workspace": str(run_store.context.repo_root),
             "run_id": run_id,
             "base_sha": actual_base,
+            "head_sha": head_sha,
             "diff_fingerprint": fingerprint,
-            "risk": run_state.get("risk"),
+            "risk": run_risk,
+            "runtime_version": run_contract.get("runtime_version", "unknown"),
             "changed_paths": list(run_state.get("changed_paths", [])),
         }
 
@@ -476,6 +726,13 @@ class HarnessService:
                     "deduplicated": True,
                 }
             self._require_campaign_open(state)
+            if status == "needs_human" and not self._unresolved_campaign_blockers(
+                state
+            ):
+                raise StateError(
+                    "needs_human requires an unresolved blocking human intervention; "
+                    "use blocked or interrupted for operational failures"
+                )
             allowed = {
                 "pending": TASK_STATUSES - {"pending"},
                 "in_progress": TASK_STATUSES - {"pending"},
@@ -489,6 +746,7 @@ class HarnessService:
                     f"campaign task cannot transition from {current} to {status}"
                 )
             if status in {"in_progress", "complete"}:
+                verify_openspec_reference(contract, store.context)
                 outstanding_dependencies = [
                     dependency
                     for dependency in definition.get("dependencies", [])
@@ -517,6 +775,8 @@ class HarnessService:
                     definition,
                     task_states,
                     task_id,
+                    contract,
+                    campaign_id,
                 )
             elif arguments.get("run_workspace") is not None or arguments.get(
                 "run_id"
@@ -529,6 +789,10 @@ class HarnessService:
             task_state["summary"] = summary
             task_state["run"] = run_reference
             task_state["updated_at"] = utc_now()
+            transition_counts = state.setdefault("task_transition_counts", {})
+            if not isinstance(transition_counts, dict):
+                raise StateError("campaign task transition counts are corrupt")
+            transition_counts[status] = int(transition_counts.get(status, 0)) + 1
             state = store.save_state(campaign_id, state)
             store.append_event(
                 campaign_id,
@@ -557,9 +821,16 @@ class HarnessService:
             arguments.get("intervention_id"), "intervention_id", maximum=80
         )
         kind = require_string(arguments.get("kind"), "kind", maximum=32)
-        if kind not in {"blocking_question", "approval", "correction", "context"}:
+        if kind not in {
+            "blocking_question",
+            "approval",
+            "correction",
+            "context",
+            "external_unblock",
+        }:
             raise InputError(
-                "kind must be blocking_question, approval, correction, or context"
+                "kind must be blocking_question, approval, correction, context, "
+                "or external_unblock"
             )
         blocking = arguments.get("blocking", False)
         resolved = arguments.get("resolved", False)
@@ -651,6 +922,72 @@ class HarnessService:
             and intervention.get("resolved") is not True
         ]
 
+    @staticmethod
+    def _integration_gaps(
+        contract: Mapping[str, Any], state: Mapping[str, Any]
+    ) -> list[str]:
+        if contract.get("integration_policy") != "combined-review-required":
+            return []
+        definitions = [
+            task
+            for task in contract.get("tasks", [])
+            if isinstance(task, Mapping) and task.get("kind") == "implementation"
+        ]
+        task_states = state.get("tasks", {})
+        if not isinstance(task_states, Mapping):
+            return ["campaign task state is corrupt"]
+        repositories = {
+            str(task.get("repository_key") or task.get("workspace"))
+            for task in definitions
+            if task.get("role", "task") == "task"
+        }
+        gaps: list[str] = []
+        for repository in sorted(repositories):
+            feature_ids = {
+                str(task.get("id"))
+                for task in definitions
+                if task.get("role", "task") == "task"
+                and str(task.get("repository_key") or task.get("workspace"))
+                == repository
+            }
+            if len(feature_ids) < 2:
+                continue
+            integrations = [
+                task
+                for task in definitions
+                if task.get("role") == "integration"
+                and str(task.get("repository_key") or task.get("workspace"))
+                == repository
+                and feature_ids.issubset(set(task.get("dependencies", [])))
+            ]
+            valid = False
+            feature_paths: set[str] = set()
+            for feature_id in feature_ids:
+                feature_state = task_states.get(feature_id)
+                feature_run = (
+                    feature_state.get("run")
+                    if isinstance(feature_state, Mapping)
+                    else None
+                )
+                if isinstance(feature_run, Mapping):
+                    feature_paths.update(feature_run.get("changed_paths", []))
+            for integration in integrations:
+                integration_state = task_states.get(str(integration.get("id")))
+                integration_run = (
+                    integration_state.get("run")
+                    if isinstance(integration_state, Mapping)
+                    else None
+                )
+                if not isinstance(integration_run, Mapping):
+                    continue
+                covered = set(integration_run.get("changed_paths", []))
+                if feature_paths.issubset(covered):
+                    valid = True
+                    break
+            if not valid:
+                gaps.append(repository)
+        return gaps
+
     def seal_campaign_candidate(
         self, arguments: Mapping[str, Any]
     ) -> dict[str, Any]:
@@ -673,6 +1010,7 @@ class HarnessService:
                     "deduplicated": True,
                 }
             self._require_campaign_open(state)
+            verify_openspec_reference(contract, store.context)
             task_states = state.get("tasks")
             if not isinstance(task_states, dict):
                 raise StateError("campaign task state is corrupt")
@@ -694,6 +1032,12 @@ class HarnessService:
                     "candidate has unresolved blocking interventions: "
                     + ", ".join(unresolved)
                 )
+            integration_gaps = self._integration_gaps(contract, state)
+            if integration_gaps:
+                raise StateError(
+                    "multi-task repositories require a completed combined "
+                    "integration run: " + ", ".join(integration_gaps)
+                )
             interventions = state.get("interventions", {})
             run_references = [
                 task["run"]
@@ -707,6 +1051,11 @@ class HarnessService:
             candidate = {
                 "summary": summary,
                 "sealed_at": utc_now(),
+                "readiness": (
+                    "pending_evaluation"
+                    if contract.get("mode") == "replay"
+                    else "ready"
+                ),
                 "task_count": len(task_states),
                 "run_references": run_references,
                 "git_snapshots": git_snapshots,
@@ -724,7 +1073,16 @@ class HarnessService:
                         if isinstance(item, dict)
                         and item.get("kind") == "correction"
                     ),
+                    "external_unblocks": sum(
+                        1
+                        for item in interventions.values()
+                        if isinstance(item, dict)
+                        and item.get("kind") == "external_unblock"
+                    ),
                 },
+                "operational_task_transitions": dict(
+                    state.get("task_transition_counts", {})
+                ),
             }
             state["candidate"] = candidate
             self._transition(state, "candidate_ready")
@@ -748,25 +1106,79 @@ class HarnessService:
     ) -> dict[str, Any]:
         store = CampaignStore.for_workspace(self._workspace(arguments))
         campaign_id = self._campaign_id(arguments)
-        raw_rubric = arguments.get("rubric")
-        if not isinstance(raw_rubric, Mapping):
-            raise InputError("rubric must be an object")
-        if set(raw_rubric) != set(COMPARISON_DIMENSIONS):
+        def normalize_rubric(name: str) -> dict[str, int]:
+            raw = arguments.get(name)
+            if not isinstance(raw, Mapping):
+                raise InputError(f"{name} must be an object")
+            if set(raw) != set(COMPARISON_DIMENSIONS):
+                raise InputError(
+                    f"{name} must contain exactly: "
+                    + ", ".join(COMPARISON_DIMENSIONS)
+                )
+            result: dict[str, int] = {}
+            for dimension in COMPARISON_DIMENSIONS:
+                value = raw.get(dimension)
+                if (
+                    not isinstance(value, int)
+                    or isinstance(value, bool)
+                    or not 0 <= value <= 4
+                ):
+                    raise InputError(
+                        f"{name}.{dimension} must be an integer from 0 to 4"
+                    )
+                result[dimension] = value
+            return result
+
+        rubric = normalize_rubric("rubric")
+        cutoff_rubric = normalize_rubric("cutoff_rubric")
+        candidate_readiness = require_string(
+            arguments.get("candidate_readiness"),
+            "candidate_readiness",
+            maximum=32,
+        )
+        if candidate_readiness not in {"unsafe", "partial", "ready"}:
             raise InputError(
-                "rubric must contain exactly: " + ", ".join(COMPARISON_DIMENSIONS)
+                "candidate_readiness must be unsafe, partial, or ready"
             )
-        rubric: dict[str, int] = {}
-        for dimension in COMPARISON_DIMENSIONS:
-            value = raw_rubric.get(dimension)
-            if (
-                not isinstance(value, int)
-                or isinstance(value, bool)
-                or not 0 <= value <= 4
-            ):
-                raise InputError(f"rubric.{dimension} must be an integer from 0 to 4")
-            rubric[dimension] = value
+        raw_attribution = arguments.get("gap_attribution", [])
+        if not isinstance(raw_attribution, list) or len(raw_attribution) > 64:
+            raise InputError("gap_attribution must contain at most 64 entries")
+        gap_attribution: list[dict[str, str]] = []
+        for index, raw in enumerate(raw_attribution):
+            if not isinstance(raw, Mapping) or set(raw) != {"gap", "category"}:
+                raise InputError(
+                    f"gap_attribution[{index}] must contain gap and category"
+                )
+            category = require_string(
+                raw.get("category"),
+                f"gap_attribution[{index}].category",
+                maximum=32,
+            )
+            if category not in {
+                "derivable_miss",
+                "underspecified",
+                "historical_only",
+                "intentional_alternative",
+            }:
+                raise InputError(f"gap_attribution[{index}].category is invalid")
+            gap_attribution.append(
+                {
+                    "gap": sanitize_text(
+                        require_string(
+                            raw.get("gap"),
+                            f"gap_attribution[{index}].gap",
+                            maximum=2_000,
+                        ),
+                        maximum=2_000,
+                    ),
+                    "category": category,
+                }
+            )
         normalized = {
             "rubric": rubric,
+            "cutoff_rubric": cutoff_rubric,
+            "candidate_readiness": candidate_readiness,
+            "gap_attribution": gap_attribution,
             "similarities": sanitize_string_list(
                 arguments.get("similarities"), item_maximum=2_000
             ),
@@ -808,6 +1220,14 @@ class HarnessService:
                 **normalized,
                 "overall_percent": round(
                     sum(rubric.values()) / (4 * len(COMPARISON_DIMENSIONS)) * 100
+                ),
+                "historical_similarity_percent": round(
+                    sum(rubric.values()) / (4 * len(COMPARISON_DIMENSIONS)) * 100
+                ),
+                "cutoff_fidelity_percent": round(
+                    sum(cutoff_rubric.values())
+                    / (4 * len(COMPARISON_DIMENSIONS))
+                    * 100
                 ),
             }
             comparison_file["comparison"] = comparison
@@ -852,6 +1272,7 @@ class HarnessService:
                     f"campaign is already terminal: {existing.get('status')}"
                 )
             if status == "complete":
+                verify_openspec_reference(contract, store.context)
                 if not isinstance(state.get("candidate"), dict):
                     raise StateError("campaign candidate is not sealed")
                 unresolved = self._unresolved_campaign_blockers(state)
@@ -864,11 +1285,35 @@ class HarnessService:
                     store.read_comparison(campaign_id).get("comparison"), dict
                 ):
                     raise StateError("replay campaign requires a historical comparison")
-            elif status in {"needs_human", "blocked"} and not summary:
-                raise InputError(f"summary is required for {status}")
+            elif status in {"needs_human", "blocked"}:
+                if not summary:
+                    raise InputError(f"summary is required for {status}")
+                if status == "needs_human" and not self._unresolved_campaign_blockers(
+                    state
+                ):
+                    raise StateError(
+                        "needs_human requires an unresolved blocking human intervention; "
+                        "use blocked or interrupted for operational failures"
+                    )
             self._transition(state, status)
             state["terminal"] = {
                 "status": status,
+                "campaign_status": (
+                    "evaluated"
+                    if status == "complete" and contract.get("mode") == "replay"
+                    else "locally_ready"
+                    if status == "complete"
+                    else status
+                ),
+                "candidate_readiness": (
+                    store.read_comparison(campaign_id)
+                    .get("comparison", {})
+                    .get("candidate_readiness", "unknown")
+                    if status == "complete" and contract.get("mode") == "replay"
+                    else "ready"
+                    if status == "complete"
+                    else "unknown"
+                ),
                 "at": utc_now(),
                 "summary": summary or "All local epic campaign gates passed",
                 "external_actions_authorized": False,
@@ -1044,6 +1489,142 @@ class HarnessService:
             "outstanding_checks": outstanding,
         }
 
+    @staticmethod
+    def _campaign_store_for_run(
+        contract: Mapping[str, Any],
+    ) -> tuple[CampaignStore, str] | None:
+        parent = contract.get("campaign")
+        if not isinstance(parent, Mapping):
+            return None
+        workspace = parent.get("workspace")
+        campaign_id = parent.get("campaign_id")
+        if not isinstance(workspace, str) or not isinstance(campaign_id, str):
+            raise StateError("run campaign reference is corrupt")
+        return CampaignStore.for_workspace(workspace), campaign_id
+
+    def _campaign_limit_action(
+        self,
+        contract: Mapping[str, Any],
+        run_id: str,
+        stage_id: str,
+    ) -> str:
+        linked = self._campaign_store_for_run(contract)
+        if linked is None:
+            return "normal"
+        store, campaign_id = linked
+        state = store.read_state(campaign_id)
+        circuit = state.setdefault("provider_circuits", {}).setdefault(
+            "anthropic",
+            {
+                "status": "closed",
+                "cooldown_until": None,
+                "probe": None,
+                "limit_count": 0,
+                "updated_at": utc_now(),
+            },
+        )
+        if not isinstance(circuit, dict) or circuit.get("status") != "open":
+            return "normal"
+        now = datetime.now(UTC)
+        cooldown_until = _parse_timestamp(circuit.get("cooldown_until"))
+        if cooldown_until is not None and now < cooldown_until:
+            return "skip"
+        probe = circuit.get("probe")
+        if isinstance(probe, Mapping):
+            started_at = _parse_timestamp(probe.get("started_at"))
+            if started_at is None or now - started_at < timedelta(hours=4):
+                return "skip"
+        circuit["probe"] = {
+            "run_id": run_id,
+            "stage_id": stage_id,
+            "started_at": utc_now(),
+        }
+        circuit["updated_at"] = utc_now()
+        store.save_state(campaign_id, state)
+        store.append_event(
+            campaign_id,
+            {"type": "anthropic_probe_started", "run_id": run_id},
+        )
+        return "probe"
+
+    def _record_campaign_provider_terminal(
+        self,
+        contract: Mapping[str, Any],
+        run_id: str,
+        stage_id: str,
+        terminal: Mapping[str, Any],
+    ) -> None:
+        linked = self._campaign_store_for_run(contract)
+        if linked is None:
+            return
+        store, campaign_id = linked
+        state = store.read_state(campaign_id)
+        circuit = state.setdefault("provider_circuits", {}).setdefault(
+            "anthropic",
+            {
+                "status": "closed",
+                "cooldown_until": None,
+                "probe": None,
+                "limit_count": 0,
+                "updated_at": utc_now(),
+            },
+        )
+        if not isinstance(circuit, dict):
+            raise StateError("campaign Anthropic circuit is corrupt")
+        probe = circuit.get("probe")
+        probe_matches = isinstance(probe, Mapping) and (
+            probe.get("run_id") == run_id and probe.get("stage_id") == stage_id
+        )
+        lifecycle = terminal.get("lifecycle_state")
+        failure_kind = terminal.get("failure_kind")
+        event: dict[str, Any] | None = None
+        if failure_kind == "anthropic_limit":
+            effective = dict(self._effective_environ() or os.environ)
+            cooldown = claude_runtime.anthropic_cooldown_seconds(effective)
+            circuit.update(
+                {
+                    "status": "open",
+                    "cooldown_until": (
+                        datetime.now(UTC) + timedelta(seconds=cooldown)
+                    ).isoformat().replace("+00:00", "Z"),
+                    "probe": None,
+                    "limit_count": int(circuit.get("limit_count", 0)) + 1,
+                    "updated_at": utc_now(),
+                }
+            )
+            event = {
+                "type": "anthropic_cooldown_opened",
+                "cooldown_until": circuit["cooldown_until"],
+            }
+        elif lifecycle == "completed" and probe_matches:
+            circuit.update(
+                {
+                    "status": "closed",
+                    "cooldown_until": None,
+                    "probe": None,
+                    "updated_at": utc_now(),
+                }
+            )
+            event = {"type": "anthropic_cooldown_closed"}
+        elif probe_matches:
+            effective = dict(self._effective_environ() or os.environ)
+            cooldown = claude_runtime.anthropic_cooldown_seconds(effective)
+            circuit.update(
+                {
+                    "status": "open",
+                    "cooldown_until": (
+                        datetime.now(UTC) + timedelta(seconds=cooldown)
+                    ).isoformat().replace("+00:00", "Z"),
+                    "probe": None,
+                    "updated_at": utc_now(),
+                }
+            )
+            event = {"type": "anthropic_probe_failed_without_fallback"}
+        if event is None:
+            return
+        store.save_state(campaign_id, state)
+        store.append_event(campaign_id, event)
+
     def _on_stage_event(
         self, workspace: str, run_id: str, event: dict[str, Any]
     ) -> None:
@@ -1064,6 +1645,7 @@ class HarnessService:
         try:
             store = RunStore.for_workspace(workspace)
             with self._lock:
+                contract = store.read_contract(run_id)
                 state = store.read_state(run_id)
                 stage = state.get("stages", {}).get(stage_id)
                 if not isinstance(stage, dict):
@@ -1131,6 +1713,12 @@ class HarnessService:
                 if stage.get("failure_kind") == "anthropic_limit":
                     event["failure_kind"] = "anthropic_limit"
                 store.append_event(run_id, event)
+                self._record_campaign_provider_terminal(
+                    contract,
+                    run_id,
+                    stage_id,
+                    terminal,
+                )
         except (InputError, StateError, OSError):
             return
 
@@ -1203,6 +1791,53 @@ class HarnessService:
             effective = dict(self._effective_environ() or os.environ)
             model = claude_runtime.resolve_model(effective)
             timeout, heartbeat, stall = claude_runtime.runtime_timing(effective)
+            limit_action = self._campaign_limit_action(contract, run_id, stage_id)
+            if limit_action == "skip":
+                stage_record = {
+                    "stage_id": stage_id,
+                    "profile": profile,
+                    "lifecycle_state": "failed",
+                    "started_at": utc_now(),
+                    "finished_at": utc_now(),
+                    "diff_fingerprint": state.get("diff_fingerprint"),
+                    "requested_model": model,
+                    "requested_effort": "high",
+                    "runtime_version": contract.get("runtime_version", "unknown"),
+                    "failure_kind": "anthropic_limit",
+                    "failure_source": "campaign_cooldown",
+                    "error": "Anthropic campaign cooldown is active",
+                    "telemetry": {},
+                }
+                state.setdefault("stages", {})[stage_id] = stage_record
+                if profile == "critic":
+                    self._transition(state, "reviewing")
+                else:
+                    self._transition(state, "failed")
+                    state["terminal"] = {
+                        "status": "failed",
+                        "at": utc_now(),
+                        "summary": "Claude implementation skipped during Anthropic cooldown",
+                    }
+                store.save_state(run_id, state)
+                store.append_event(
+                    run_id,
+                    {
+                        "type": "stage_skipped",
+                        "stage_id": stage_id,
+                        "profile": profile,
+                        "failure_kind": "anthropic_limit",
+                        "failure_source": "campaign_cooldown",
+                    },
+                )
+                return {
+                    "run_id": run_id,
+                    "stage_id": stage_id,
+                    "profile": profile,
+                    "status": "failed",
+                    "claude_invoked": False,
+                    "terminal": stage_record,
+                    "deduplicated": False,
+                }
             command = claude_runtime.build_command(
                 str(claude_info["path"]), profile=profile, model=model
             )
@@ -1215,6 +1850,8 @@ class HarnessService:
                 "diff_fingerprint": state.get("diff_fingerprint"),
                 "requested_model": model,
                 "requested_effort": "high",
+                "runtime_version": contract.get("runtime_version", "unknown"),
+                "campaign_probe": limit_action == "probe",
             }
             state.setdefault("stages", {})[stage_id] = stage_record
             if profile == "critic":
@@ -1262,6 +1899,12 @@ class HarnessService:
                     "summary": "Claude process failed before inference",
                 }
                 store.save_state(run_id, current)
+                self._record_campaign_provider_terminal(
+                    contract,
+                    run_id,
+                    stage_id,
+                    {"lifecycle_state": "failed"},
+                )
                 raise
             self._stages[key] = stage
         return {

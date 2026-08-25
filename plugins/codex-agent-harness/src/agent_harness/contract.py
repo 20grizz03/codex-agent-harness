@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .git_repo import RepoContext, status_snapshot
+from .git_repo import RepoContext, resolve_base_sha, status_snapshot
 from .policy import validate_checks, validate_risk
 from .store import SCHEMA_VERSION
 from .util import (
@@ -64,6 +64,7 @@ def build_contract(
     now = utc_now()
     run_id = new_run_id()
     risk = validate_risk(arguments.get("risk", "medium"))
+    base_sha = resolve_base_sha(context, arguments.get("base_sha"))
     frozen_checks = validate_checks(
         arguments.get("required_checks", []), source="contract"
     )
@@ -74,7 +75,7 @@ def build_contract(
         "workspace": str(context.workspace),
         "repo_root": str(context.repo_root),
         "git_dir": str(context.git_dir),
-        "base_sha": context.head_sha,
+        "base_sha": base_sha,
         "initial_worktree": dirty,
         "allow_dirty": allow_dirty,
         "goal": require_string(arguments.get("goal"), "goal"),

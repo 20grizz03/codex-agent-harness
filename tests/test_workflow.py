@@ -8,6 +8,8 @@ from pathlib import Path
 import _support
 
 from agent_harness.service import HarnessService
+from agent_harness.campaign import CampaignStore
+from agent_harness.review import build_stage_prompt
 from agent_harness.store import RunStore
 from agent_harness.util import StateError
 
@@ -62,6 +64,14 @@ def wait_for_stage(
 
 
 class CodexWriterWorkflowTests(unittest.TestCase):
+    def test_high_risk_review_focus_uses_escalated_state_risk(self) -> None:
+        prompt = build_stage_prompt(
+            profile="critic",
+            contract={"risk": "medium"},
+            state={"risk": "high", "check_results": {}},
+        )
+        self.assertIn("security boundaries, authentication", prompt)
+
     def _service(
         self, directory: Path, result: dict | None = None, **updates: str
     ) -> HarnessService:
@@ -193,6 +203,215 @@ class CodexWriterWorkflowTests(unittest.TestCase):
             )
             critic = next(iter(persisted["state"]["stages"].values()))
             self.assertEqual("anthropic_limit", critic["failure_kind"])
+
+    def test_campaign_limit_skips_until_one_later_probe_recovers(self) -> None:
+        with _support.TempRepo() as repo, tempfile.TemporaryDirectory() as directory:
+            _support.prepare_openspec_change(repo, commit=True)
+            marker = Path(directory) / "invoked"
+            service = self._service(
+                Path(directory),
+                FAKE_CLAUDE_MODE="limit_result",
+                FAKE_CLAUDE_MARKER=str(marker),
+                AGENT_HARNESS_ANTHROPIC_COOLDOWN_SECONDS="3600",
+            )
+            tasks = [
+                {
+                    "id": task_id,
+                    "title": task_id,
+                    "goal": f"Complete {task_id}",
+                    "done_when": [f"{task_id} works"],
+                    "kind": "implementation",
+                }
+                for task_id in ("T-1", "T-I", "T-2", "T-3")
+            ]
+            campaign = service.create_campaign(
+                {
+                    "workspace": str(repo.path),
+                    "title": "Cooldown campaign",
+                    "goal": "Verify provider recovery",
+                    "done_when": ["All tasks are reviewed"],
+                    "source": {"kind": "local", "ref": "cooldown-test"},
+                    "risk": "medium",
+                    "spec": {"kind": "openspec", "change_id": "add-feature"},
+                    "tasks": tasks,
+                }
+            )
+            campaign_id = campaign["contract"]["campaign_id"]
+            campaign_common = {
+                "workspace": str(repo.path),
+                "campaign_id": campaign_id,
+            }
+
+            def create_checked_run(task_id: str, *, allow_dirty: bool) -> str:
+                service.record_campaign_task(
+                    {
+                        **campaign_common,
+                        "task_id": task_id,
+                        "status": "in_progress",
+                    }
+                )
+                run = service.create_run(
+                    {
+                        "workspace": str(repo.path),
+                        "goal": f"Implement {task_id}",
+                        "done_when": [f"{task_id} works"],
+                        "allow_dirty": allow_dirty,
+                        "campaign": {
+                            **campaign_common,
+                            "task_id": task_id,
+                        },
+                    }
+                )
+                run_id = run["contract"]["run_id"]
+                run_planned_checks(service, repo.path, run_id)
+                return run_id
+
+            (repo.path / "README.md").write_text("changed\n", encoding="utf-8")
+            first_run = create_checked_run("T-1", allow_dirty=True)
+            first_stage = service.start_stage(
+                {
+                    "workspace": str(repo.path),
+                    "run_id": first_run,
+                    "profile": "critic",
+                }
+            )
+            first_terminal = wait_for_stage(
+                service, repo.path, first_run, first_stage["stage_id"]
+            )
+            self.assertEqual("anthropic_limit", first_terminal["failure_kind"])
+            store = CampaignStore.for_workspace(repo.path)
+            _support.wait_until(
+                lambda: store.read_state(campaign_id)["provider_circuits"][
+                    "anthropic"
+                ]["status"]
+                == "open"
+            )
+            service.record_review_resolution(
+                {
+                    "workspace": str(repo.path),
+                    "run_id": first_run,
+                    "review": _support.PASS_REVIEW,
+                    "resolutions": [],
+                }
+            )
+            service.finish_run(
+                {
+                    "workspace": str(repo.path),
+                    "run_id": first_run,
+                    "status": "complete",
+                }
+            )
+            service.record_campaign_task(
+                {
+                    **campaign_common,
+                    "task_id": "T-1",
+                    "status": "complete",
+                    "run_workspace": str(repo.path),
+                    "run_id": first_run,
+                }
+            )
+
+            marker.unlink()
+            service.record_campaign_task(
+                {
+                    **campaign_common,
+                    "task_id": "T-I",
+                    "status": "in_progress",
+                }
+            )
+            implement_run = service.create_run(
+                {
+                    "workspace": str(repo.path),
+                    "goal": "Implement T-I with Claude",
+                    "done_when": ["T-I works"],
+                    "allow_dirty": True,
+                    "writer": "claude",
+                    "writer_explicit": True,
+                    "campaign": {**campaign_common, "task_id": "T-I"},
+                }
+            )["contract"]["run_id"]
+            skipped_implement = service.start_stage(
+                {
+                    "workspace": str(repo.path),
+                    "run_id": implement_run,
+                    "profile": "implement",
+                }
+            )
+            self.assertFalse(skipped_implement["claude_invoked"])
+            self.assertEqual(
+                "failed",
+                service.get_run(
+                    {"workspace": str(repo.path), "run_id": implement_run}
+                )["state"]["phase"],
+            )
+            self.assertEqual(
+                "open",
+                store.read_state(campaign_id)["provider_circuits"]["anthropic"][
+                    "status"
+                ],
+            )
+            self.assertFalse(marker.exists())
+
+            second_run = create_checked_run("T-2", allow_dirty=True)
+            skipped = service.start_stage(
+                {
+                    "workspace": str(repo.path),
+                    "run_id": second_run,
+                    "profile": "critic",
+                }
+            )
+            self.assertFalse(skipped["claude_invoked"])
+            self.assertFalse(marker.exists())
+            service.record_review_resolution(
+                {
+                    "workspace": str(repo.path),
+                    "run_id": second_run,
+                    "review": _support.PASS_REVIEW,
+                    "resolutions": [],
+                }
+            )
+            service.finish_run(
+                {
+                    "workspace": str(repo.path),
+                    "run_id": second_run,
+                    "status": "complete",
+                }
+            )
+            service.record_campaign_task(
+                {
+                    **campaign_common,
+                    "task_id": "T-2",
+                    "status": "complete",
+                    "run_workspace": str(repo.path),
+                    "run_id": second_run,
+                }
+            )
+
+            state = store.read_state(campaign_id)
+            state["provider_circuits"]["anthropic"]["cooldown_until"] = (
+                "2000-01-01T00:00:00Z"
+            )
+            store.save_state(campaign_id, state)
+            service.environ["FAKE_CLAUDE_MODE"] = "success"
+            third_run = create_checked_run("T-3", allow_dirty=True)
+            probe = service.start_stage(
+                {
+                    "workspace": str(repo.path),
+                    "run_id": third_run,
+                    "profile": "critic",
+                }
+            )
+            self.assertTrue(probe["claude_invoked"])
+            terminal = wait_for_stage(
+                service, repo.path, third_run, probe["stage_id"]
+            )
+            self.assertEqual("completed", terminal["lifecycle_state"])
+            _support.wait_until(
+                lambda: store.read_state(campaign_id)["provider_circuits"][
+                    "anthropic"
+                ]["status"]
+                == "closed"
+            )
 
     def test_generic_critic_failure_does_not_enable_fallback(self) -> None:
         with _support.TempRepo() as repo, tempfile.TemporaryDirectory() as directory:

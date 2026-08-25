@@ -41,6 +41,17 @@ class McpContractTests(unittest.TestCase):
             self.assertFalse(tool["inputSchema"].get("additionalProperties", True))
             self.assertFalse(tool["annotations"]["destructiveHint"])
 
+    def test_create_campaign_exposes_bounded_openspec_reference(self) -> None:
+        create_campaign = next(
+            tool for tool in TOOLS if tool["name"] == "create_campaign"
+        )
+        schema = create_campaign["inputSchema"]["properties"]["spec"]
+        self.assertEqual(["openspec"], schema["properties"]["kind"]["enum"])
+        self.assertEqual(
+            "^[a-z0-9][a-z0-9-]*$",
+            schema["properties"]["change_id"]["pattern"],
+        )
+
     def test_mcp_allowlist_matches_public_tool_surface(self) -> None:
         configuration = json.loads(
             (_support.PLUGIN_ROOT / ".mcp.json").read_text(encoding="utf-8")
@@ -96,6 +107,7 @@ class McpContractTests(unittest.TestCase):
                     "title": "Epic",
                     "goal": "Deliver the epic",
                     "done_when": ["The epic is complete"],
+                    "risk": "medium",
                     "source": {"kind": "jira", "ref": "DEMO-1"},
                     "tasks": [
                         {

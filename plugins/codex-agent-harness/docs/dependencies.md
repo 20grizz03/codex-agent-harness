@@ -34,6 +34,32 @@ codex plugin add ponytail@ponytail
 
 Its absence does not break the Agent Harness MCP server, but the setup audit reports that the default minimal-implementation profile is incomplete.
 
+## OpenSpec decomposition
+
+[OpenSpec](https://github.com/Fission-AI/OpenSpec) is the required planning layer before implementing large ideas, high-risk changes, ambiguous changes, and multi-task epics. Agent Harness continues to own execution state, checks, worktrees, and review. A ready single Jira task does not require OpenSpec.
+
+OpenSpec currently requires Node.js 20.19.0 or newer. Install the CLI separately:
+
+```bash
+npm install -g @fission-ai/openspec@latest
+```
+
+From a checkout of this repository, copy the bundled concise schema into the user-level OpenSpec schema directory and validate it:
+
+```bash
+mkdir -p ~/.local/share/openspec/schemas
+cp -R plugins/codex-agent-harness/skills/epic-workflow/assets/openspec-schema/agent-harness ~/.local/share/openspec/schemas/
+env OPENSPEC_TELEMETRY=0 openspec schema validate agent-harness
+```
+
+Initialize each target repository only when its owners want versioned specs:
+
+```bash
+env OPENSPEC_TELEMETRY=0 openspec init
+```
+
+The setup audit never runs installation, schema copy, or `openspec init`. Agent Harness disables OpenSpec telemetry in every command it invokes. The custom schema requires concise Russian content, explicit unresolved questions, behavior and failure contracts, security/data, recovery, operability, compatibility, UI/source material, one independently verifiable Agent Harness task per checkbox, a capability preflight, and a combined integration run.
+
 ## Scenario integrations
 
 These are required only when the task uses the corresponding system:

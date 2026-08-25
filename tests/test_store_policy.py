@@ -50,6 +50,31 @@ class GitFingerprintTests(unittest.TestCase):
             )
             self.assertEqual(["README.md"], paths)
 
+    def test_run_can_freeze_an_ancestor_as_combined_review_base(self) -> None:
+        with _support.TempRepo() as repo:
+            base_sha = resolve_repo(repo.path).head_sha
+            (repo.path / "README.md").write_text("committed\n", encoding="utf-8")
+            _support.git(repo.path, "add", "README.md")
+            _support.git(repo.path, "commit", "-m", "change")
+            run = HarnessService({}).create_run(
+                {
+                    "workspace": str(repo.path),
+                    "goal": "Review the combined result",
+                    "done_when": ["Combined diff is checked"],
+                    "base_sha": base_sha,
+                }
+            )
+            self.assertEqual(base_sha, run["contract"]["base_sha"])
+            with self.assertRaisesRegex(InputError, "local commit"):
+                HarnessService({}).create_run(
+                    {
+                        "workspace": str(repo.path),
+                        "goal": "Use an invalid base",
+                        "done_when": ["Never starts"],
+                        "base_sha": "a" * 40,
+                    }
+                )
+
     def test_linked_worktree_has_isolated_absolute_git_dir(self) -> None:
         with _support.TempRepo() as repo, tempfile.TemporaryDirectory() as parent:
             worktree = Path(parent) / "isolated"
@@ -57,6 +82,7 @@ class GitFingerprintTests(unittest.TestCase):
             primary = resolve_repo(repo.path)
             linked = resolve_repo(worktree)
             self.assertNotEqual(primary.git_dir, linked.git_dir)
+            self.assertEqual(primary.git_common_dir, linked.git_common_dir)
             self.assertIn("worktrees", str(linked.git_dir))
 
 

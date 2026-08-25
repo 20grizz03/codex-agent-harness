@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,11 +13,15 @@ from typing import Sequence
 from .util import InputError, unique_in_order
 
 
+SHA_RE = re.compile(r"^[a-fA-F0-9]{7,64}$")
+
+
 @dataclass(frozen=True)
 class RepoContext:
     workspace: Path
     repo_root: Path
     git_dir: Path
+    git_common_dir: Path
     head_sha: str
 
 
@@ -69,8 +74,39 @@ def resolve_repo(workspace: str | Path) -> RepoContext:
     git_dir = Path(
         _git_text(candidate, ["rev-parse", "--absolute-git-dir"])
     ).resolve()
+    git_common_dir = Path(
+        _git_text(
+            candidate,
+            ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )
+    ).resolve()
     head_sha = _git_text(candidate, ["rev-parse", "HEAD"])
-    return RepoContext(candidate, repo_root, git_dir, head_sha)
+    return RepoContext(candidate, repo_root, git_dir, git_common_dir, head_sha)
+
+
+def resolve_base_sha(context: RepoContext, value: str | None) -> str:
+    """Resolve an explicit review base and require it to be an ancestor of HEAD."""
+
+    if value is None:
+        return context.head_sha
+    if not SHA_RE.fullmatch(value):
+        raise InputError("base_sha is invalid")
+    resolved = run_git(
+        context.repo_root,
+        ["rev-parse", "--verify", f"{value}^{{commit}}"],
+        text=True,
+    )
+    if resolved.returncode != 0:
+        raise InputError("base_sha does not identify a local commit")
+    base_sha = (resolved.stdout or "").strip().lower()
+    ancestor = run_git(
+        context.repo_root,
+        ["merge-base", "--is-ancestor", base_sha, context.head_sha],
+        text=True,
+    )
+    if ancestor.returncode != 0:
+        raise InputError("base_sha must be an ancestor of HEAD")
+    return base_sha
 
 
 def _status_records(context: RepoContext) -> list[tuple[str, str]]:

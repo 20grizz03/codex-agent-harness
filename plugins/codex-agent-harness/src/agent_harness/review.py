@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from .policy import RISK_RANK
 from .util import (
     FINDING_ID_RE,
     InputError,
@@ -252,6 +253,18 @@ def build_stage_prompt(
     check_results = state.get("check_results", {}).get(
         state.get("diff_fingerprint", ""), {}
     )
+    review_focus = []
+    effective_risk = max(
+        (contract.get("risk"), state.get("risk")),
+        key=lambda value: RISK_RANK.get(str(value), -1),
+    )
+    if profile == "critic" and effective_risk == "high":
+        review_focus = [
+            "security boundaries, authentication, public identifiers, and PII exposure",
+            "failure recovery, retries, idempotency, retention, and partial completion",
+            "API and downstream compatibility, including error and state contracts",
+            "runtime wiring, workers, schedulers, deployment, observability, and rollback",
+        ]
     packet = {
         "task_contract": {
             key: contract.get(key)
@@ -266,6 +279,8 @@ def build_stage_prompt(
                 "forbidden_actions",
                 "writer",
                 "risk",
+                "campaign",
+                "runtime_version",
             )
         },
         "current_evidence": {
@@ -282,6 +297,7 @@ def build_stage_prompt(
                 }
                 for name, result in sorted(check_results.items())
             ],
+            "review_focus": review_focus,
         },
     }
     instruction = (

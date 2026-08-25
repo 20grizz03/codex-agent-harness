@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -31,6 +32,30 @@ CAMPAIGN_ID_RE = re.compile(
 )
 TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$")
 SHA_RE = re.compile(r"^[a-fA-F0-9]{7,64}$")
+OPENSPEC_CHANGE_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,127}$")
+OPENSPEC_ARCHIVE_RE_TEMPLATE = r"^[0-9]{4}-[0-9]{2}-[0-9]{2}-%s$"
+OPENSPEC_CHECKBOX_RE = re.compile(rb"(?m)^([ \t]*-[ \t]+)\[[ xX]\]")
+OPENSPEC_SCHEMA_RE = re.compile(
+    rb"(?m)^[ \t]*schema:[ \t]*agent-harness[ \t]*(?:#.*)?$"
+)
+
+OPENSPEC_PROPOSAL_HEADINGS = (
+    "Why",
+    "What Changes",
+    "Non-Goals",
+    "Impact",
+    "Open Questions",
+)
+OPENSPEC_DESIGN_HEADINGS = (
+    "Security and Data",
+    "Failure and Recovery",
+    "Operability",
+    "Compatibility",
+    "UI and Source Material",
+)
+
+MAX_OPENSPEC_FILES = 512
+MAX_OPENSPEC_BYTES = 8 * 1024 * 1024
 
 CAMPAIGN_MODES = {"delivery", "replay"}
 SOURCE_KINDS = {"jira", "local"}
@@ -137,6 +162,217 @@ def _source(value: Any) -> dict[str, str]:
     }
 
 
+def _repo_local(path: Path, repo_root: Path, name: str) -> None:
+    try:
+        path.resolve().relative_to(repo_root.resolve())
+    except ValueError as exc:
+        raise InputError(f"{name} escaped the repository") from exc
+
+
+def _openspec_layout(context: RepoContext) -> tuple[Path, Path]:
+    openspec_root = context.repo_root / "openspec"
+    changes_root = openspec_root / "changes"
+    config = openspec_root / "config.yaml"
+    if openspec_root.is_symlink() or changes_root.is_symlink():
+        raise InputError("OpenSpec directories must not be symlinks")
+    if not config.is_file() or config.is_symlink():
+        raise InputError(
+            "OpenSpec must already be initialized with openspec/config.yaml"
+        )
+    if not changes_root.is_dir():
+        raise InputError("OpenSpec changes directory does not exist")
+    for path, name in (
+        (openspec_root, "openspec"),
+        (changes_root, "openspec/changes"),
+        (config, "openspec/config.yaml"),
+    ):
+        _repo_local(path, context.repo_root, name)
+    return openspec_root, changes_root
+
+
+def _openspec_change_dir(
+    context: RepoContext,
+    change_id: str,
+    *,
+    allow_archive: bool,
+) -> Path:
+    _, changes_root = _openspec_layout(context)
+    active = changes_root / change_id
+    if active.is_symlink():
+        raise InputError("OpenSpec change directory must not be a symlink")
+    if active.is_dir():
+        _repo_local(active, context.repo_root, "OpenSpec change")
+        return active
+    if not allow_archive:
+        raise InputError(f"OpenSpec change does not exist: {change_id}")
+
+    archive_root = changes_root / "archive"
+    if archive_root.is_symlink():
+        raise InputError("OpenSpec archive directory must not be a symlink")
+    if not archive_root.is_dir():
+        raise InputError(
+            f"OpenSpec change is neither active nor archived: {change_id}"
+        )
+    _repo_local(archive_root, context.repo_root, "OpenSpec archive")
+    archive_name = re.compile(
+        OPENSPEC_ARCHIVE_RE_TEMPLATE % re.escape(change_id)
+    )
+    candidates = [
+        path
+        for path in archive_root.iterdir()
+        if archive_name.fullmatch(path.name)
+    ]
+    if len(candidates) != 1:
+        raise InputError(
+            f"OpenSpec archive must contain exactly one change: {change_id}"
+        )
+    archived = candidates[0]
+    if archived.is_symlink() or not archived.is_dir():
+        raise InputError("OpenSpec archived change must be a real directory")
+    _repo_local(archived, context.repo_root, "OpenSpec archived change")
+    return archived
+
+
+def _openspec_fingerprint(change_dir: Path) -> str:
+    files: list[Path] = []
+    total_bytes = 0
+    for path in sorted(
+        change_dir.rglob("*"),
+        key=lambda item: item.relative_to(change_dir).as_posix(),
+    ):
+        if path.is_symlink():
+            raise InputError("OpenSpec change must not contain symlinks")
+        if path.is_dir():
+            continue
+        if not path.is_file():
+            raise InputError("OpenSpec change contains a non-file entry")
+        files.append(path)
+        total_bytes += path.stat().st_size
+        if len(files) > MAX_OPENSPEC_FILES or total_bytes > MAX_OPENSPEC_BYTES:
+            raise InputError("OpenSpec change is too large to freeze safely")
+
+    relative_files = {
+        path.relative_to(change_dir).as_posix(): path for path in files
+    }
+    missing = [
+        name
+        for name in (".openspec.yaml", "proposal.md", "design.md", "tasks.md")
+        if name not in relative_files
+    ]
+    spec_files = [
+        name
+        for name in relative_files
+        if name.startswith("specs/") and name.endswith(".md")
+    ]
+    if not spec_files:
+        missing.append("specs/**/*.md")
+    if missing:
+        raise InputError(
+            "OpenSpec change is incomplete; missing: " + ", ".join(missing)
+        )
+
+    metadata = relative_files[".openspec.yaml"].read_bytes()
+    if not OPENSPEC_SCHEMA_RE.search(metadata):
+        raise InputError("OpenSpec change must use schema: agent-harness")
+
+    for relative, headings in (
+        ("proposal.md", OPENSPEC_PROPOSAL_HEADINGS),
+        ("design.md", OPENSPEC_DESIGN_HEADINGS),
+    ):
+        content = relative_files[relative].read_text(encoding="utf-8")
+        absent = [
+            heading
+            for heading in headings
+            if not re.search(rf"(?m)^## {re.escape(heading)}[ \t]*$", content)
+        ]
+        if absent:
+            raise InputError(
+                f"OpenSpec {relative} is missing required headings: "
+                + ", ".join(absent)
+            )
+
+    digest = hashlib.sha256()
+    digest.update(b"agent-harness-openspec-v1\0")
+    for relative, path in relative_files.items():
+        digest.update(relative.encode("utf-8", errors="surrogateescape"))
+        digest.update(b"\0")
+        content = path.read_bytes()
+        if relative == "tasks.md":
+            content = OPENSPEC_CHECKBOX_RE.sub(rb"\1[ ]", content)
+        digest.update(content)
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _openspec_reference(
+    value: Any,
+    context: RepoContext,
+) -> dict[str, str] | None:
+    if value is None:
+        return None
+    spec = _exact_object(value, "spec", allowed={"kind", "change_id"})
+    kind = require_string(spec.get("kind"), "spec.kind", maximum=32)
+    if kind != "openspec":
+        raise InputError("spec.kind must be openspec")
+    change_id = require_string(
+        spec.get("change_id"), "spec.change_id", maximum=128
+    )
+    if not OPENSPEC_CHANGE_RE.fullmatch(change_id):
+        raise InputError("spec.change_id must be lowercase kebab-case")
+    change_dir = _openspec_change_dir(
+        context,
+        change_id,
+        allow_archive=False,
+    )
+
+    return {
+        "kind": kind,
+        "change_id": change_id,
+        "path": change_dir.relative_to(context.repo_root).as_posix(),
+        "sha256": _openspec_fingerprint(change_dir),
+    }
+
+
+def verify_openspec_reference(
+    contract: Mapping[str, Any],
+    context: RepoContext,
+) -> None:
+    reference = contract.get("spec")
+    if reference is None:
+        return
+    if not isinstance(reference, Mapping) or set(reference) != {
+        "kind",
+        "change_id",
+        "path",
+        "sha256",
+    }:
+        raise StateError("campaign OpenSpec reference is corrupt")
+    try:
+        kind = require_string(reference.get("kind"), "spec.kind", maximum=32)
+        change_id = require_string(
+            reference.get("change_id"), "spec.change_id", maximum=128
+        )
+        expected_path = f"openspec/changes/{change_id}"
+        if (
+            kind != "openspec"
+            or not OPENSPEC_CHANGE_RE.fullmatch(change_id)
+            or reference.get("path") != expected_path
+        ):
+            raise InputError("invalid stored OpenSpec reference")
+        change_dir = _openspec_change_dir(
+            context,
+            change_id,
+            allow_archive=True,
+        )
+        current = _openspec_fingerprint(change_dir)
+    except InputError as exc:
+        raise StateError(f"cannot verify approved OpenSpec change: {exc}") from exc
+    if reference.get("sha256") != current:
+        raise StateError(
+            "OpenSpec change differs from the approved campaign specification"
+        )
+
+
 def _tasks(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list) or not 1 <= len(value) <= 64:
         raise InputError("tasks must contain between 1 and 64 entries")
@@ -155,6 +391,8 @@ def _tasks(value: Any) -> list[dict[str, Any]]:
                 "dependencies",
                 "workspace",
                 "base_sha",
+                "base_from_task",
+                "role",
             },
         )
         task_id = require_string(task.get("id"), f"tasks[{index}].id", maximum=80)
@@ -198,6 +436,20 @@ def _tasks(value: Any) -> list[dict[str, Any]]:
             "kind": kind,
             "dependencies": dependencies,
         }
+        role = require_string(
+            task.get("role", "task"),
+            f"tasks[{index}].role",
+            maximum=32,
+        )
+        if role not in {"task", "integration", "finalizer"}:
+            raise InputError(
+                f"tasks[{index}].role must be task, integration, or finalizer"
+            )
+        if kind != "implementation" and role != "task":
+            raise InputError(
+                f"tasks[{index}].role is only valid for implementation tasks"
+            )
+        normalized["role"] = role
         if task.get("workspace") is not None:
             normalized["workspace"] = require_string(
                 task.get("workspace"),
@@ -213,6 +465,25 @@ def _tasks(value: Any) -> list[dict[str, Any]]:
             if not SHA_RE.fullmatch(base_sha):
                 raise InputError(f"tasks[{index}].base_sha is invalid")
             normalized["base_sha"] = base_sha.lower()
+        if task.get("base_from_task") is not None:
+            base_from_task = require_string(
+                task.get("base_from_task"),
+                f"tasks[{index}].base_from_task",
+                maximum=80,
+            )
+            if kind != "implementation":
+                raise InputError(
+                    f"tasks[{index}].base_from_task requires implementation kind"
+                )
+            if base_from_task not in dependencies:
+                raise InputError(
+                    f"tasks[{index}].base_from_task must be a dependency"
+                )
+            if "base_sha" in normalized:
+                raise InputError(
+                    f"tasks[{index}] cannot set both base_sha and base_from_task"
+                )
+            normalized["base_from_task"] = base_from_task
         tasks.append(normalized)
         seen.add(task_id)
     return tasks
@@ -236,6 +507,7 @@ def build_campaign(
             "risk",
             "mode",
             "source",
+            "spec",
             "cutoff_at",
             "tasks",
         },
@@ -246,12 +518,18 @@ def build_campaign(
     cutoff_at = _cutoff(arguments.get("cutoff_at")) if mode == "replay" else None
     if mode == "delivery" and arguments.get("cutoff_at") is not None:
         raise InputError("cutoff_at is only valid for replay campaigns")
+    if mode == "replay" and arguments.get("spec") is not None:
+        raise InputError("spec is only valid for delivery campaigns")
+    spec = _openspec_reference(arguments.get("spec"), context)
+    risk = validate_risk(arguments.get("risk", "high"))
 
     now = utc_now()
     campaign_id = new_campaign_id()
     tasks = _tasks(arguments.get("tasks"))
+    task_definitions: dict[str, dict[str, Any]] = {}
     for task in tasks:
         if task["kind"] != "implementation":
+            task_definitions[task["id"]] = task
             continue
         task_context = (
             resolve_repo(task["workspace"])
@@ -259,16 +537,58 @@ def build_campaign(
             else context
         )
         task["workspace"] = str(task_context.repo_root)
-        task.setdefault("base_sha", task_context.head_sha)
+        task["repository_key"] = str(task_context.git_common_dir)
+        base_from_task = task.get("base_from_task")
+        if isinstance(base_from_task, str):
+            predecessor = task_definitions.get(base_from_task)
+            if not isinstance(predecessor, dict) or predecessor.get(
+                "kind"
+            ) != "implementation":
+                raise InputError("base_from_task must reference an implementation task")
+            if predecessor.get("repository_key") != task["repository_key"]:
+                raise InputError("base_from_task must use the same repository")
+        else:
+            task.setdefault("base_sha", task_context.head_sha)
+        task_definitions[task["id"]] = task
+
+    implementation_count = sum(
+        task["kind"] == "implementation" and task.get("role") != "finalizer"
+        for task in tasks
+    )
+    if mode == "delivery" and spec is None and (
+        risk == "high"
+        or implementation_count > 1
+        or any(task.get("role") == "finalizer" for task in tasks)
+    ):
+        raise InputError(
+            "an approved OpenSpec change is required for high-risk or multi-task "
+            "delivery campaigns"
+        )
 
     initial_worktree = status_snapshot(context)
     if initial_worktree["dirty"]:
-        paths = ", ".join(str(path) for path in initial_worktree["paths"][:8])
-        suffix = " ..." if len(initial_worktree["paths"]) > 8 else ""
-        raise InputError(
-            "campaign workspace is dirty; use an isolated worktree before "
-            f"creating the campaign ({paths}{suffix})"
-        )
+        if spec is None:
+            paths = ", ".join(
+                str(path) for path in initial_worktree["paths"][:8]
+            )
+            suffix = " ..." if len(initial_worktree["paths"]) > 8 else ""
+            raise InputError(
+                "campaign workspace is dirty; use an isolated worktree before "
+                f"creating the campaign ({paths}{suffix})"
+            )
+        spec_prefix = f"{spec['path']}/"
+        unrelated = [
+            str(path)
+            for path in initial_worktree["paths"]
+            if not str(path).startswith(spec_prefix)
+        ]
+        if unrelated:
+            paths = ", ".join(unrelated[:8])
+            suffix = " ..." if len(unrelated) > 8 else ""
+            raise InputError(
+                "campaign workspace is dirty outside the frozen OpenSpec "
+                f"change ({paths}{suffix})"
+            )
     contract = {
         "schema_version": SCHEMA_VERSION,
         "campaign_id": campaign_id,
@@ -301,12 +621,14 @@ def build_campaign(
                 ]
             )
         ),
-        "risk": validate_risk(arguments.get("risk", "high")),
+        "risk": risk,
         "mode": mode,
         "source": _source(arguments.get("source")),
+        "spec": spec,
         "cutoff_at": cutoff_at,
         "withheld_evidence": REPLAY_WITHHELD_EVIDENCE if mode == "replay" else [],
         "tasks": tasks,
+        "integration_policy": "combined-review-required",
         "interaction_policy": (
             "задавать вопросы только при блокирующем продуктовом выборе "
             "или внешнем изменении"
@@ -332,7 +654,18 @@ def build_campaign(
             }
             for task in tasks
         },
+        "task_transition_counts": {},
         "interventions": {},
+        "provider_circuits": {
+            "anthropic": {
+                "status": "closed",
+                "cooldown_until": None,
+                "probe": None,
+                "limit_count": 0,
+                "updated_at": now,
+            }
+        },
+        "runtime_versions": [],
         "candidate": None,
         "terminal": None,
     }

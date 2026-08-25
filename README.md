@@ -2,9 +2,9 @@
 
 `codex-agent-harness` is a local Codex plugin for durable repository-changing tasks and multi-task epic campaigns. Codex records immutable contracts, runs deterministic checks through its normal sandbox, obtains one fresh independent review per implementation run, and completes only against evidence tied to the current diff.
 
-The plugin includes delivery-writing conventions: compact Jira tasks, post-implementation testing recommendations, one- or two-sentence PR descriptions, natural Russian technical prose, and concise colleague-facing review comments. Drafting text does not authorize changing Jira or publishing to GitHub.
+The plugin includes delivery-writing conventions: compact Jira tasks, post-implementation testing recommendations, one- or two-sentence PR descriptions, natural Russian technical prose, and concise colleague-facing review comments. Drafting text does not authorize changing Jira or publishing to GitHub. Large ideas, high-risk changes, and live multi-task epics keep their approved decomposition in OpenSpec; Agent Harness remains the execution and evidence layer.
 
-Version 2.1 can read Jira epics and GitHub Enterprise delivery state through connectors already available to Codex. It can assign up to three dependency-free tasks to separate Codex subagents, including a terminal same-repository task group isolated in worktrees; a dedicated integration task rechecks and reviews their combined result. Every task keeps its own review. Claude remains the default critic; only a confirmed Anthropic usage limit permits one fresh read-only Codex fallback review, recorded explicitly as `codex_fallback`. Other Claude failures do not trigger retries or fallback.
+Version 2.1 can read Jira epics and GitHub Enterprise delivery state through connectors already available to Codex. It can assign up to three dependency-free tasks to separate Codex subagents. Sequential tasks use clean chained commits, while a dedicated integration task rechecks and reviews the combined repository result. Every task keeps its own review. Claude remains the default critic; a confirmed Anthropic usage limit opens a campaign cooldown with one later recovery probe and explicit `codex_fallback` reviews meanwhile. Other Claude failures do not trigger retries or fallback.
 
 ## Skills
 
@@ -38,7 +38,7 @@ claude auth login
 
 Start a new Codex task after installation so the skills and MCP tools are discovered from the installed snapshot. Ask Codex to check Agent Harness setup; the check does not invoke a model or install anything.
 
-See [`plugins/codex-agent-harness/docs/dependencies.md`](plugins/codex-agent-harness/docs/dependencies.md) for the complete runtime, companion-skill, connector, and development-tool inventory bundled with the plugin.
+See [`plugins/codex-agent-harness/docs/dependencies.md`](plugins/codex-agent-harness/docs/dependencies.md) for the complete runtime, optional OpenSpec setup, companion-skill, connector, and development-tool inventory bundled with the plugin.
 
 ## Install from a local checkout
 
@@ -64,7 +64,7 @@ Runtime state is stored per target worktree under:
 <absolute-git-dir>/codex-agent-harness/campaigns/<campaign-id>/
 ```
 
-The worktree remains clean. Run and campaign contracts, atomic state, append-only events, reviews, and replay comparisons live in Git metadata with mode `0600`.
+Operational state never dirties the worktree. Run and campaign contracts, atomic state, append-only events, reviews, and replay comparisons live in Git metadata with mode `0600`; optional OpenSpec artifacts are ordinary versioned repository files.
 
 Repository owners can add path-based risk escalation and deterministic checks through [`docs/configuration.md`](docs/configuration.md). The configuration can only add gates or raise risk; it cannot weaken the contract frozen at run creation.
 

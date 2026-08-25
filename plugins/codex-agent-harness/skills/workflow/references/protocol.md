@@ -18,7 +18,7 @@ Approval authorizes reversible local edits, checks, corrections, and commits wit
 
 ## 3. Freeze the contract
 
-Before editing, call `create_run` with the goal, non-goals, observable `done_when` criteria, constraints, forbidden actions, risk, and checks discovered from repository guidance. Default to `writer: codex`, `risk: medium`, and one correction pass.
+Before editing, call `create_run` with the goal, non-goals, observable `done_when` criteria, constraints, forbidden actions, risk, and checks discovered from repository guidance. Default to `writer: codex`, `risk: medium`, and one correction pass. For an epic task also pass its `campaign` reference; the server resolves its base, inherits campaign risk, and freezes the active plugin version.
 
 Use `writer: claude` only after an explicit current-task request and set `writer_explicit: true`. Never ask one provider to be both writer and independent critic.
 
@@ -28,7 +28,7 @@ The contract is immutable. If the goal or acceptance criteria materially change,
 
 Implement the requested outcome as Codex unless the contract names Claude. Preserve unrelated changes and do not commit unless the current task authorizes it.
 
-Call `plan_checks` after the diff exists. Run every returned command exactly as an argv array, subject to the normal sandbox and egress audit. Record each result with `record_check`; include only a short sanitized summary, never raw logs or secrets.
+Call `plan_checks` after the diff exists. For a campaign task that is a later `base_from_task` predecessor, create its already-approved atomic local commit before the final check plan so the next task receives a clean base. If review correction is needed, amend that commit once and rerun all checks. Run every returned command exactly as an argv array, subject to the normal sandbox and egress audit. Record each result with `record_check`; include only a short sanitized summary, never raw logs or secrets.
 
 The egress audit restricts execution, not repository editing. Shared queues, databases, mail, APIs, or other endpoints never revoke an approved local implementation plan. Continue writing the code, then isolate the command with safe configuration. If that is impossible, leave it unrun and report the resulting completion blocker; an additional safe check does not erase a mandatory result.
 
@@ -38,7 +38,7 @@ The server binds check results to the current diff fingerprint. Any later edit m
 
 For a Codex-written change, delegate one `critic` stage to a fresh native tracking subagent. The proxy calls `start_stage`, polls with `poll_stage`, and cancels only when asked or when the task is abandoned. Claude reads the repository and Git directly; do not paste the diff into its prompt.
 
-Do not retry the Claude stage. If and only if its terminal state contains `failure_kind: anthropic_limit`, delegate the same read-only review contract to one fresh native Codex subagent with no inherited task conversation. It must inspect the repository and Git itself. Supply its structured result to `record_review_resolution`; the server records origin `codex_fallback`. This degraded path may close the local run, but must be disclosed in the result. A timeout, authentication problem, process failure, invalid output, cancellation, or quality-floor violation never enables fallback.
+Do not retry the Claude stage. If and only if its terminal state contains `failure_kind: anthropic_limit`, delegate the same read-only review contract to one fresh native Codex subagent with no inherited task conversation. A campaign cooldown may produce that terminal state without invoking Claude; it is still an explicit degraded review. The server permits one probe after cooldown expiry and restores Claude after a successful probe. Supply the fallback result to `record_review_resolution`; the server records origin `codex_fallback`. A timeout, authentication problem, process failure, invalid output, cancellation, or quality-floor violation never enables fallback.
 
 Codex verifies every returned finding against the code and records dispositions with `record_review_resolution`:
 

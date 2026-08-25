@@ -16,13 +16,16 @@ SERVER_NAME = "agent-harness"
 SERVER_INSTRUCTIONS = (
     "Codex owns epic campaign state, task state, and deterministic checks. "
     "Campaign completion is local and never authorizes tracker or GitHub writes. "
+    "Approved OpenSpec references are semantically fingerprinted and rechecked "
+    "by the server and never replace campaign execution state. "
     "A replay candidate must be sealed before historical evidence is compared. "
     "Model-backed lifecycle "
     "tools start_stage, poll_stage, and cancel_stage are proxy-only: call them "
     "from one native tracking subagent, not from the user-facing lead. The "
     "critic profile is read-only. The implement profile requires explicit "
     "Claude writer authority in the immutable run contract. A confirmed "
-    "Anthropic critic limit permits one explicit Codex fallback review. Local completion "
+    "Anthropic critic limit permits an explicit Codex fallback review and opens "
+    "a campaign cooldown with one later recovery probe. Local completion "
     "does not authorize push, PR publication, tracker changes, deploys, or "
     "other external mutations."
 )
@@ -128,6 +131,30 @@ CAMPAIGN_SOURCE_SCHEMA = {
     },
     "additionalProperties": False,
 }
+CAMPAIGN_SPEC_SCHEMA = {
+    "type": "object",
+    "required": ["kind", "change_id"],
+    "properties": {
+        "kind": {"type": "string", "enum": ["openspec"]},
+        "change_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[a-z0-9][a-z0-9-]*$",
+        },
+    },
+    "additionalProperties": False,
+}
+CAMPAIGN_RUN_SCHEMA = {
+    "type": "object",
+    "required": ["workspace", "campaign_id", "task_id"],
+    "properties": {
+        "workspace": WORKSPACE,
+        "campaign_id": CAMPAIGN_ID,
+        "task_id": {"type": "string", "minLength": 1, "maxLength": 80},
+    },
+    "additionalProperties": False,
+}
 CAMPAIGN_TASK_SCHEMA = {
     "type": "object",
     "required": ["id", "title", "goal", "done_when"],
@@ -152,6 +179,15 @@ CAMPAIGN_TASK_SCHEMA = {
         },
         "workspace": WORKSPACE,
         "base_sha": {"type": "string", "minLength": 7, "maxLength": 64},
+        "base_from_task": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 80,
+        },
+        "role": {
+            "type": "string",
+            "enum": ["task", "integration", "finalizer"],
+        },
     },
     "additionalProperties": False,
 }
@@ -195,9 +231,10 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "create_campaign",
         "description": (
-            "Freeze one local epic campaign with ordered tasks. Replay campaigns "
-            "also freeze a cutoff and the categories of historical evidence withheld "
-            "until the candidate is sealed. Does not read or change Jira or GitHub."
+            "Freeze one local epic campaign with ordered tasks and a server-fingerprinted "
+            "OpenSpec change required for high-risk or multi-task delivery. Replay campaigns freeze a "
+            "cutoff and withheld-evidence categories. Does not read or change Jira "
+            "or GitHub."
         ),
         "inputSchema": {
             "type": "object",
@@ -237,6 +274,7 @@ TOOLS: list[dict[str, Any]] = [
                 "risk": {"type": "string", "enum": ["low", "medium", "high"]},
                 "mode": {"type": "string", "enum": ["delivery", "replay"]},
                 "source": CAMPAIGN_SOURCE_SCHEMA,
+                "spec": CAMPAIGN_SPEC_SCHEMA,
                 "cutoff_at": {"type": "string", "minLength": 1, "maxLength": 64},
                 "tasks": {
                     "type": "array",
@@ -287,7 +325,7 @@ TOOLS: list[dict[str, Any]] = [
         "name": "record_campaign_task",
         "description": (
             "Record one ordered campaign task transition. Completing an implementation "
-            "task requires a terminal complete v1 run from its repository."
+            "task enforces campaign risk, its resolved base, and a terminal complete v1 run."
         ),
         "inputSchema": {
             "type": "object",
@@ -320,8 +358,8 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "record_campaign_intervention",
         "description": (
-            "Record one sanitized summary of human context, approval, correction, or "
-            "blocking question so autonomy can be measured without saving raw dialogue."
+            "Record one actual sanitized human context, approval, correction, external "
+            "unblock, or blocking question. Operational transitions are counted separately."
         ),
         "inputSchema": {
             "type": "object",
@@ -344,7 +382,13 @@ TOOLS: list[dict[str, Any]] = [
                 },
                 "kind": {
                     "type": "string",
-                    "enum": ["blocking_question", "approval", "correction", "context"],
+                    "enum": [
+                        "blocking_question",
+                        "approval",
+                        "correction",
+                        "context",
+                        "external_unblock",
+                    ],
                 },
                 "reason": {"type": "string", "minLength": 1, "maxLength": 2000},
                 "outcome": {"type": "string", "maxLength": 2000},
@@ -381,17 +425,49 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "record_campaign_comparison",
         "description": (
-            "After a replay candidate is sealed, record a bounded comparison against "
-            "historical Jira, PR, and Git evidence. Raw diffs and connector output "
-            "must not be supplied."
+            "After a replay candidate is sealed, record cutoff fidelity, historical "
+            "similarity, gap attribution, and readiness. Raw diffs and connector "
+            "output must not be supplied."
         ),
         "inputSchema": {
             "type": "object",
-            "required": ["workspace", "campaign_id", "rubric"],
+            "required": [
+                "workspace",
+                "campaign_id",
+                "rubric",
+                "cutoff_rubric",
+                "candidate_readiness",
+            ],
             "properties": {
                 "workspace": WORKSPACE,
                 "campaign_id": CAMPAIGN_ID,
                 "rubric": CAMPAIGN_RUBRIC_SCHEMA,
+                "cutoff_rubric": CAMPAIGN_RUBRIC_SCHEMA,
+                "candidate_readiness": {
+                    "type": "string",
+                    "enum": ["unsafe", "partial", "ready"],
+                },
+                "gap_attribution": {
+                    "type": "array",
+                    "maxItems": 64,
+                    "items": {
+                        "type": "object",
+                        "required": ["gap", "category"],
+                        "properties": {
+                            "gap": {"type": "string", "maxLength": 2000},
+                            "category": {
+                                "type": "string",
+                                "enum": [
+                                    "derivable_miss",
+                                    "underspecified",
+                                    "historical_only",
+                                    "intentional_alternative",
+                                ],
+                            },
+                        },
+                        "additionalProperties": False,
+                    },
+                },
                 "similarities": {
                     "type": "array",
                     "maxItems": 64,
@@ -453,7 +529,8 @@ TOOLS: list[dict[str, Any]] = [
         "name": "create_run",
         "description": (
             "Create one immutable task contract in target Git metadata before "
-            "repository edits. Rejects dirty worktrees unless explicitly acknowledged."
+            "repository edits. An optional campaign link resolves base and minimum risk. "
+            "Rejects dirty worktrees unless explicitly acknowledged."
         ),
         "inputSchema": {
             "type": "object",
@@ -496,6 +573,12 @@ TOOLS: list[dict[str, Any]] = [
                     "maximum": 1,
                 },
                 "allow_dirty": {"type": "boolean"},
+                "base_sha": {
+                    "type": "string",
+                    "minLength": 7,
+                    "maxLength": 64,
+                },
+                "campaign": CAMPAIGN_RUN_SCHEMA,
             },
             "additionalProperties": False,
         },
@@ -585,7 +668,8 @@ TOOLS: list[dict[str, Any]] = [
         "description": (
             "PROXY-ONLY: start the single Claude critic or explicitly authorized "
             "Claude implementation stage. Subscription readiness and green-check "
-            "gates are enforced before inference. Never call from the Codex lead."
+            "gates are enforced before inference; a campaign cooldown may skip Claude "
+            "and enable the explicit Codex fallback. Never call from the Codex lead."
         ),
         "inputSchema": {
             "type": "object",

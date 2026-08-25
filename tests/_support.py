@@ -56,6 +56,57 @@ class TempRepo:
         self.close()
 
 
+def prepare_openspec_change(
+    repo: TempRepo,
+    change_id: str = "add-feature",
+    *,
+    commit: bool = False,
+) -> None:
+    openspec = repo.path / "openspec"
+    openspec.mkdir()
+    (openspec / "config.yaml").write_text(
+        "schema: agent-harness\n", encoding="utf-8"
+    )
+    git(repo.path, "add", "openspec/config.yaml")
+    git(repo.path, "commit", "-m", "initialize openspec")
+
+    change = openspec / "changes" / change_id
+    change.mkdir(parents=True)
+    (change / ".openspec.yaml").write_text(
+        "schema: agent-harness\n", encoding="utf-8"
+    )
+    (change / "proposal.md").write_text(
+        "## Why\n\nNeed it.\n\n"
+        "## What Changes\n\nBehavior changes.\n\n"
+        "## Non-Goals\n\nNone.\n\n"
+        "## Impact\n\nRepository only.\n\n"
+        "## Open Questions\n\nNone.\n",
+        encoding="utf-8",
+    )
+    (change / "design.md").write_text(
+        "## Security and Data\n\nNo sensitive data.\n\n"
+        "## Failure and Recovery\n\nRetry is not needed.\n\n"
+        "## Operability\n\nNo runtime wiring.\n\n"
+        "## Compatibility\n\nBackward compatible.\n\n"
+        "## UI and Source Material\n\nNo UI.\n",
+        encoding="utf-8",
+    )
+    specs = change / "specs" / "feature"
+    specs.mkdir(parents=True)
+    (specs / "spec.md").write_text(
+        "## ADDED Requirements\n\n"
+        "### Requirement: Feature\n\nThe system MUST work.\n\n"
+        "#### Scenario: Success\n\n- **WHEN** requested\n- **THEN** it works\n",
+        encoding="utf-8",
+    )
+    (change / "tasks.md").write_text(
+        "## 1. Work\n\n- [ ] 1.1 Implement and verify\n", encoding="utf-8"
+    )
+    if commit:
+        git(repo.path, "add", f"openspec/changes/{change_id}")
+        git(repo.path, "commit", "-m", "add openspec change")
+
+
 PASS_REVIEW = {
     "verdict": "pass",
     "findings": [],
