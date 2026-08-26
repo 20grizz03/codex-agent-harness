@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import _support
 
-from agent_harness.campaign import CampaignStore
+from agent_harness.campaign import CampaignStore, verify_openspec_reference
 from agent_harness.git_repo import diff_fingerprint, resolve_repo
 from agent_harness.service import HarnessService
 from agent_harness.store import RunStore
@@ -39,7 +39,7 @@ def campaign_arguments(
     with_spec: bool = False,
 ) -> dict:
     if with_spec:
-        _support.prepare_openspec_change(repo, commit=True)
+        _support.prepare_local_openspec_change(repo)
     arguments = {
         "workspace": str(repo.path),
         "title": "Epic campaign",
@@ -53,7 +53,7 @@ def campaign_arguments(
     if mode == "replay":
         arguments["cutoff_at"] = "2026-01-01T00:00:00Z"
     if with_spec:
-        arguments["spec"] = {"kind": "openspec", "change_id": "add-feature"}
+        arguments["spec"] = _support.local_openspec_spec()
     return arguments
 
 
@@ -81,6 +81,22 @@ def complete_run(repo: _support.TempRepo | Path, run_id: str) -> None:
 
 
 class CampaignTests(unittest.TestCase):
+    def test_complex_single_task_routes_to_openspec_before_run(self) -> None:
+        workflow = (
+            _support.PLUGIN_ROOT / "skills/workflow/references/protocol.md"
+        ).read_text(encoding="utf-8")
+        epic = (
+            _support.PLUGIN_ROOT / "skills/epic-workflow/SKILL.md"
+        ).read_text(encoding="utf-8")
+
+        self.assertLess(
+            workflow.index("Before `create_run`"),
+            workflow.index("OpenSpec is mandatory"),
+        )
+        self.assertIn("Google, Facebook, and Yandex", workflow)
+        self.assertIn("one-task campaign", workflow)
+        self.assertIn("одну сложную задачу", epic)
+
     def test_bundled_openspec_schema_has_declared_templates(self) -> None:
         root = (
             _support.PLUGIN_ROOT
@@ -92,6 +108,186 @@ class CampaignTests(unittest.TestCase):
         for template in ("proposal.md", "spec.md", "design.md", "tasks.md"):
             self.assertTrue((root / "templates" / template).is_file(), template)
 
+    def test_local_openspec_is_default_ignored_and_privately_snapshotted(
+        self,
+    ) -> None:
+        with _support.TempRepo() as repo:
+            _support.prepare_local_openspec_change(repo)
+            arguments = campaign_arguments(repo)
+            arguments["spec"] = _support.local_openspec_spec()
+
+            created = HarnessService({}).create_campaign(arguments)
+
+            reference = created["contract"]["spec"]
+            self.assertEqual("local", reference["storage"])
+            self.assertEqual("openspec/changes/add-feature", reference["path"])
+            self.assertFalse(created["contract"]["initial_worktree"]["dirty"])
+            self.assertNotIn("Need it", str(created["contract"]))
+            store = CampaignStore.for_workspace(repo.path)
+            context = resolve_repo(repo.path)
+            self.assertEqual(
+                str(context.git_common_dir), created["contract"]["git_common_dir"]
+            )
+            self.assertEqual(context.git_common_dir, store.root.parents[1])
+            snapshot = store.spec_dir(created["contract"]["campaign_id"])
+            self.assertEqual(
+                _support.openspec_files()["proposal.md"],
+                (snapshot / "proposal.md").read_text(encoding="utf-8"),
+            )
+            for path in snapshot.rglob("*"):
+                expected = 0o700 if path.is_dir() else 0o600
+                self.assertEqual(expected, stat.S_IMODE(path.stat().st_mode), path)
+
+    def test_local_openspec_must_be_ignored(self) -> None:
+        with _support.TempRepo() as repo:
+            prepare_openspec_change(repo)
+            arguments = campaign_arguments(repo)
+            arguments["spec"] = _support.local_openspec_spec()
+            with self.assertRaisesRegex(InputError, "storage=repository"):
+                HarnessService({}).create_campaign(arguments)
+
+    def test_local_openspec_accepts_project_gitignore(self) -> None:
+        with _support.TempRepo() as repo:
+            exclude = repo.path / ".git" / "info" / "exclude"
+            original_exclude = exclude.read_text(encoding="utf-8")
+            _support.prepare_local_openspec_change(repo)
+            (repo.path / ".gitignore").write_text("/openspec/\n", encoding="utf-8")
+            _support.git(repo.path, "add", ".gitignore")
+            _support.git(repo.path, "commit", "-m", "ignore local openspec")
+            exclude.write_text(original_exclude, encoding="utf-8")
+
+            arguments = campaign_arguments(repo)
+            arguments["spec"] = _support.local_openspec_spec()
+            created = HarnessService({}).create_campaign(arguments)
+            self.assertEqual("local", created["contract"]["spec"]["storage"])
+
+    def test_local_campaign_snapshot_uses_git_common_directory(self) -> None:
+        with _support.TempRepo() as repo, tempfile.TemporaryDirectory() as parent:
+            worktree = Path(parent) / "worktree"
+            _support.git(
+                repo.path,
+                "worktree",
+                "add",
+                "--detach",
+                str(worktree),
+                "HEAD",
+            )
+            _support.prepare_local_openspec_change(worktree)
+            arguments = campaign_arguments(repo)
+            arguments["workspace"] = str(worktree)
+            arguments["spec"] = _support.local_openspec_spec()
+
+            created = HarnessService({}).create_campaign(arguments)
+            store = CampaignStore.for_workspace(worktree)
+            self.assertEqual((repo.path / ".git").resolve(), store.root.parents[1])
+            self.assertTrue(
+                store.spec_dir(created["contract"]["campaign_id"]).is_dir()
+            )
+
+    def test_local_campaign_transition_from_linked_worktree(self) -> None:
+        with _support.TempRepo() as repo, tempfile.TemporaryDirectory() as parent:
+            _support.prepare_local_openspec_change(repo)
+            worktree = Path(parent) / "worktree"
+            _support.git(
+                repo.path,
+                "worktree",
+                "add",
+                "--detach",
+                str(worktree),
+                "HEAD",
+            )
+            service = HarnessService({})
+            arguments = campaign_arguments(repo)
+            arguments["spec"] = _support.local_openspec_spec()
+            campaign = service.create_campaign(arguments)
+
+            result = service.record_campaign_task(
+                {
+                    "workspace": str(worktree),
+                    "campaign_id": campaign["contract"]["campaign_id"],
+                    "task_id": "T-1",
+                    "status": "in_progress",
+                }
+            )
+
+            self.assertEqual("in_progress", result["task"]["status"])
+
+    def test_linked_worktree_reads_legacy_campaign_location(self) -> None:
+        with _support.TempRepo() as repo, tempfile.TemporaryDirectory() as parent:
+            worktree = Path(parent) / "worktree"
+            _support.git(
+                repo.path,
+                "worktree",
+                "add",
+                "--detach",
+                str(worktree),
+                "HEAD",
+            )
+            service = HarnessService({})
+            arguments = campaign_arguments(repo)
+            arguments["workspace"] = str(worktree)
+            campaign = service.create_campaign(arguments)
+            campaign_id = campaign["contract"]["campaign_id"]
+            store = CampaignStore.for_workspace(worktree)
+            current = store.root / campaign_id
+            legacy = (
+                resolve_repo(worktree).git_dir
+                / "codex-agent-harness"
+                / "campaigns"
+                / campaign_id
+            )
+            legacy.parent.mkdir(parents=True)
+            current.rename(legacy)
+
+            loaded = service.get_campaign(
+                {"workspace": str(worktree), "campaign_id": campaign_id}
+            )
+
+            self.assertEqual(campaign_id, loaded["contract"]["campaign_id"])
+            self.assertIn(campaign_id, store.list_campaign_ids())
+
+    def test_local_openspec_source_and_snapshot_are_both_frozen(self) -> None:
+        with _support.TempRepo() as repo:
+            _support.prepare_local_openspec_change(repo)
+            service = HarnessService({})
+            arguments = campaign_arguments(repo)
+            arguments["spec"] = _support.local_openspec_spec()
+            created = service.create_campaign(arguments)
+            campaign_id = created["contract"]["campaign_id"]
+            common = {
+                "workspace": str(repo.path),
+                "campaign_id": campaign_id,
+                "task_id": "T-1",
+                "status": "in_progress",
+            }
+
+            proposal = repo.path / "openspec/changes/add-feature/proposal.md"
+            original = proposal.read_text(encoding="utf-8")
+            proposal.write_text(
+                original.replace("Need it.", "Changed."), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(StateError, "approved campaign specification"):
+                service.record_campaign_task(common)
+
+            proposal.write_text(original, encoding="utf-8")
+            snapshot = CampaignStore.for_workspace(repo.path).spec_dir(campaign_id)
+            stored = snapshot / "proposal.md"
+            stored.write_text(
+                original.replace("Need it.", "Tampered."), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(StateError, "approved campaign specification"):
+                service.record_campaign_task(common)
+
+    def test_local_openspec_size_is_bounded(self) -> None:
+        with _support.TempRepo() as repo:
+            _support.prepare_local_openspec_change(repo)
+            large = repo.path / "openspec/changes/add-feature/large.bin"
+            large.write_bytes(b"x" * (8 * 1024 * 1024 + 1))
+            arguments = campaign_arguments(repo)
+            arguments["spec"] = _support.local_openspec_spec()
+            with self.assertRaisesRegex(InputError, "too large"):
+                HarnessService({}).create_campaign(arguments)
+
     def test_openspec_change_is_fingerprinted_and_allows_its_dirty_files(self) -> None:
         with _support.TempRepo() as repo:
             prepare_openspec_change(repo)
@@ -99,10 +295,12 @@ class CampaignTests(unittest.TestCase):
             arguments["spec"] = {
                 "kind": "openspec",
                 "change_id": "add-feature",
+                "storage": "repository",
             }
             first = HarnessService({}).create_campaign(arguments)
             reference = first["contract"]["spec"]
             self.assertEqual("openspec", reference["kind"])
+            self.assertEqual("repository", reference["storage"])
             self.assertEqual("openspec/changes/add-feature", reference["path"])
             self.assertEqual(64, len(reference["sha256"]))
             self.assertTrue(first["contract"]["initial_worktree"]["dirty"])
@@ -120,6 +318,10 @@ class CampaignTests(unittest.TestCase):
                 reference["sha256"], second["contract"]["spec"]["sha256"]
             )
 
+            legacy = {"spec": dict(second["contract"]["spec"])}
+            legacy["spec"].pop("storage")
+            verify_openspec_reference(legacy, resolve_repo(repo.path))
+
     def test_openspec_fingerprint_ignores_only_checkbox_progress(self) -> None:
         with _support.TempRepo() as repo:
             prepare_openspec_change(repo)
@@ -127,6 +329,7 @@ class CampaignTests(unittest.TestCase):
             arguments["spec"] = {
                 "kind": "openspec",
                 "change_id": "add-feature",
+                "storage": "repository",
             }
             original = HarnessService({}).create_campaign(arguments)
             tasks = repo.path / "openspec/changes/add-feature/tasks.md"
@@ -147,6 +350,7 @@ class CampaignTests(unittest.TestCase):
             arguments["spec"] = {
                 "kind": "openspec",
                 "change_id": "add-feature",
+                "storage": "repository",
             }
             campaign = HarnessService({}).create_campaign(arguments)
             proposal = repo.path / "openspec/changes/add-feature/proposal.md"
@@ -189,6 +393,7 @@ class CampaignTests(unittest.TestCase):
             arguments["spec"] = {
                 "kind": "openspec",
                 "change_id": "add-feature",
+                "storage": "repository",
             }
             campaign = service.create_campaign(arguments)
             common = {
@@ -244,6 +449,7 @@ class CampaignTests(unittest.TestCase):
             arguments["spec"] = {
                 "kind": "openspec",
                 "change_id": "add-feature",
+                "storage": "repository",
             }
             with self.assertRaisesRegex(InputError, "outside the frozen OpenSpec"):
                 HarnessService({}).create_campaign(arguments)
@@ -254,6 +460,7 @@ class CampaignTests(unittest.TestCase):
             arguments["spec"] = {
                 "kind": "openspec",
                 "change_id": "add-feature",
+                "storage": "repository",
             }
             with self.assertRaisesRegex(InputError, "already be initialized"):
                 HarnessService({}).create_campaign(arguments)
@@ -265,6 +472,7 @@ class CampaignTests(unittest.TestCase):
             arguments["spec"] = {
                 "kind": "openspec",
                 "change_id": "add-feature",
+                "storage": "repository",
             }
             with self.assertRaisesRegex(InputError, "missing:.*tasks.md"):
                 HarnessService({}).create_campaign(arguments)
@@ -279,6 +487,7 @@ class CampaignTests(unittest.TestCase):
             arguments["spec"] = {
                 "kind": "openspec",
                 "change_id": "add-feature",
+                "storage": "repository",
             }
             with self.assertRaisesRegex(InputError, "must not contain symlinks"):
                 HarnessService({}).create_campaign(arguments)
@@ -293,6 +502,7 @@ class CampaignTests(unittest.TestCase):
             arguments["spec"] = {
                 "kind": "openspec",
                 "change_id": "add-feature",
+                "storage": "repository",
             }
             with self.assertRaisesRegex(InputError, "must not be symlinks"):
                 HarnessService({}).create_campaign(arguments)
@@ -304,6 +514,7 @@ class CampaignTests(unittest.TestCase):
             arguments["spec"] = {
                 "kind": "openspec",
                 "change_id": "add-feature",
+                "storage": "repository",
             }
             with self.assertRaisesRegex(InputError, "delivery campaigns"):
                 HarnessService({}).create_campaign(arguments)
@@ -835,6 +1046,7 @@ class CampaignTests(unittest.TestCase):
             arguments["spec"] = {
                 "kind": "openspec",
                 "change_id": "add-feature",
+                "storage": "repository",
             }
             campaign = service.create_campaign(arguments)
             common = {

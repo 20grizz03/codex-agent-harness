@@ -155,6 +155,40 @@ class StoreTests(unittest.TestCase):
                 ],
             )
 
+    def test_completed_stage_clears_stale_interruption(self) -> None:
+        with _support.TempRepo() as repo:
+            service = HarnessService()
+            run = service.create_run(
+                {
+                    "workspace": str(repo.path),
+                    "goal": "Update docs",
+                    "done_when": ["Docs are current"],
+                }
+            )
+            run_id = run["contract"]["run_id"]
+            store = RunStore.for_workspace(repo.path)
+            state = store.read_state(run_id)
+            state["phase"] = "reviewing"
+            stage_id = f"{run_id}:critic:1"
+            state["terminal"] = {
+                "status": "interrupted",
+                "source": "stage_recovery",
+                "stage_ids": [stage_id],
+            }
+            state["stages"] = {
+                stage_id: {
+                    "profile": "critic",
+                    "lifecycle_state": "completed",
+                }
+            }
+            store.save_state(run_id, state)
+
+            recovered = service.get_run(
+                {"workspace": str(repo.path), "run_id": run_id}
+            )
+
+            self.assertIsNone(recovered["state"]["terminal"])
+
     def test_dirty_worktree_is_rejected_without_explicit_acknowledgement(self) -> None:
         with _support.TempRepo() as repo:
             original = "user change\n"

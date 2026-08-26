@@ -146,6 +146,8 @@ class HarnessService:
                 "status": "interrupted",
                 "at": utc_now(),
                 "summary": "An in-flight model stage cannot be resumed safely",
+                "source": "stage_recovery",
+                "stage_ids": interrupted_stage_ids,
             }
             state = store.save_state(run_id, state)
             store.append_event(
@@ -163,6 +165,18 @@ class HarnessService:
                     stage_id,
                     {"lifecycle_state": "interrupted"},
                 )
+        elif (
+            state.get("phase") not in TERMINAL_PHASES
+            and isinstance(state.get("terminal"), dict)
+            and state["terminal"].get("status") == "interrupted"
+            and state["terminal"].get("source") == "stage_recovery"
+        ):
+            state["terminal"] = None
+            state = store.save_state(run_id, state)
+            store.append_event(
+                run_id,
+                {"type": "stale_interruption_cleared"},
+            )
         return state
 
     @staticmethod
@@ -445,7 +459,7 @@ class HarnessService:
     def create_campaign(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
         workspace = self._workspace(arguments)
         context = resolve_repo(workspace)
-        contract, state = build_campaign(dict(arguments), context)
+        contract, state, spec_files = build_campaign(dict(arguments), context)
         version = _runtime_version()
         contract["runtime_version"] = version
         state["runtime_versions"] = [
@@ -453,7 +467,7 @@ class HarnessService:
         ]
         store = CampaignStore(context)
         with self._lock:
-            store.create(contract, state)
+            store.create(contract, state, spec_files)
             store.append_event(
                 contract["campaign_id"],
                 {"type": "phase_changed", "from": "prepared", "to": "executing"},
@@ -746,7 +760,11 @@ class HarnessService:
                     f"campaign task cannot transition from {current} to {status}"
                 )
             if status in {"in_progress", "complete"}:
-                verify_openspec_reference(contract, store.context)
+                verify_openspec_reference(
+                    contract,
+                    store.context,
+                    store.spec_dir(campaign_id),
+                )
                 outstanding_dependencies = [
                     dependency
                     for dependency in definition.get("dependencies", [])
@@ -1010,7 +1028,11 @@ class HarnessService:
                     "deduplicated": True,
                 }
             self._require_campaign_open(state)
-            verify_openspec_reference(contract, store.context)
+            verify_openspec_reference(
+                contract,
+                store.context,
+                store.spec_dir(campaign_id),
+            )
             task_states = state.get("tasks")
             if not isinstance(task_states, dict):
                 raise StateError("campaign task state is corrupt")
@@ -1272,7 +1294,11 @@ class HarnessService:
                     f"campaign is already terminal: {existing.get('status')}"
                 )
             if status == "complete":
-                verify_openspec_reference(contract, store.context)
+                verify_openspec_reference(
+                    contract,
+                    store.context,
+                    store.spec_dir(campaign_id),
+                )
                 if not isinstance(state.get("candidate"), dict):
                     raise StateError("campaign candidate is not sealed")
                 unresolved = self._unresolved_campaign_blockers(state)
@@ -1654,6 +1680,9 @@ class HarnessService:
                 stage["lifecycle_state"] = lifecycle
                 stage["finished_at"] = utc_now()
                 stage["telemetry"] = terminal.get("telemetry", {})
+                if lifecycle == "completed":
+                    stage.pop("error", None)
+                    stage.pop("failure_kind", None)
                 if terminal.get("error"):
                     stage["error"] = sanitize_text(
                         terminal.get("error"), maximum=1_000
@@ -1661,7 +1690,28 @@ class HarnessService:
                 if terminal.get("failure_kind") == "anthropic_limit":
                     stage["failure_kind"] = "anthropic_limit"
                 profile = stage.get("profile")
-                if lifecycle == "completed" and profile == "critic":
+                run_terminal = state.get("terminal")
+                recovered_stage_ids = (
+                    run_terminal.get("stage_ids", [])
+                    if isinstance(run_terminal, dict)
+                    else []
+                )
+                recovery_terminal_cleared = bool(
+                    isinstance(run_terminal, dict)
+                    and run_terminal.get("status") == "interrupted"
+                    and run_terminal.get("source") == "stage_recovery"
+                    and stage_id in recovered_stage_ids
+                )
+                preserve_run_terminal = (
+                    isinstance(run_terminal, dict)
+                    and not recovery_terminal_cleared
+                )
+                if recovery_terminal_cleared:
+                    state["terminal"] = None
+
+                if preserve_run_terminal:
+                    pass
+                elif lifecycle == "completed" and profile == "critic":
                     review_value = terminal.get("result")
                     review = validate_review(review_value, origin="claude")
                     review_file = store.read_review(run_id)
@@ -1704,6 +1754,14 @@ class HarnessService:
                         "summary": stage.get("error", "Claude stage failed"),
                     }
                 store.save_state(run_id, state)
+                if recovery_terminal_cleared:
+                    store.append_event(
+                        run_id,
+                        {
+                            "type": "stale_interruption_cleared",
+                            "stage_id": stage_id,
+                        },
+                    )
                 event = {
                     "type": "stage_persisted",
                     "stage_id": stage_id,
@@ -2244,8 +2302,21 @@ class HarnessService:
         )
         with self._lock:
             contract = store.read_contract(run_id)
+            raw_state = store.read_state(run_id)
+            active_stage_ids = [
+                stage_id
+                for stage_id, stage in raw_state.get("stages", {}).items()
+                if isinstance(stage, dict)
+                and stage.get("lifecycle_state") == "running"
+                and self._stage_key(store, run_id, stage_id) in self._stages
+            ]
+            if active_stage_ids:
+                raise StateError(
+                    "cannot finish run while a model stage is active; "
+                    "call cancel_stage first"
+                )
             state = self._recover_interrupted(
-                store, run_id, store.read_state(run_id)
+                store, run_id, raw_state
             )
             existing_terminal = state.get("terminal")
             if isinstance(existing_terminal, dict):

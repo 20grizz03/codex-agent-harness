@@ -6,7 +6,7 @@ Codex is the lead and default writer. Claude is an independent critic unless the
 
 The only review fallback is one fresh read-only native Codex reviewer after the Claude critic returns the sanitized `anthropic_limit` failure or a campaign cooldown emits the equivalent no-inference terminal. Persist it as `codex_fallback`; never retry the same Claude stage or use fallback for timeouts, authentication failures, process errors, invalid output, or cancellation. A later campaign task may make one recovery probe after the persisted cooldown expires.
 
-Operational state belongs under each target repository's absolute Git directory, never in its worktree. Persist only allowlisted structured data; never persist raw Claude JSONL, prompts, tool arguments, stderr, credentials, or environment values.
+Run state belongs under the target worktree's absolute Git directory. Campaign state and its approved local OpenSpec snapshot belong under the repository's common Git directory so isolated worktrees share them. Neither may enter the worktree. Persist only allowlisted structured data; never persist raw Claude JSONL, prompts, tool arguments, stderr, credentials, or environment values.
 
 Run before committing:
 

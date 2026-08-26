@@ -56,6 +56,68 @@ class TempRepo:
         self.close()
 
 
+def openspec_files() -> dict[str, str]:
+    return {
+        ".openspec.yaml": "schema: agent-harness\n",
+        "proposal.md": (
+            "## Why\n\nNeed it.\n\n"
+            "## What Changes\n\nBehavior changes.\n\n"
+            "## Non-Goals\n\nNone.\n\n"
+            "## Impact\n\nRepository only.\n\n"
+            "## Open Questions\n\nNone.\n"
+        ),
+        "design.md": (
+            "## Security and Data\n\nNo sensitive data.\n\n"
+            "## Failure and Recovery\n\nRetry is not needed.\n\n"
+            "## Operability\n\nNo runtime wiring.\n\n"
+            "## Compatibility\n\nBackward compatible.\n\n"
+            "## UI and Source Material\n\nNo UI.\n"
+        ),
+        "specs/feature/spec.md": (
+            "## ADDED Requirements\n\n"
+            "### Requirement: Feature\n\nThe system MUST work.\n\n"
+            "#### Scenario: Success\n\n"
+            "- **WHEN** requested\n- **THEN** it works\n"
+        ),
+        "tasks.md": "## 1. Work\n\n- [ ] 1.1 Implement and verify\n",
+    }
+
+
+def local_openspec_spec(change_id: str = "add-feature") -> dict[str, Any]:
+    return {
+        "kind": "openspec",
+        "change_id": change_id,
+    }
+
+
+def prepare_local_openspec_change(
+    repo: TempRepo | Path,
+    change_id: str = "add-feature",
+) -> None:
+    workspace = repo.path if isinstance(repo, TempRepo) else repo
+    exclude = Path(
+        git(
+            workspace,
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "info/exclude",
+        )
+    )
+    existing = exclude.read_text(encoding="utf-8")
+    exclude.write_text(existing + "\n/openspec/\n", encoding="utf-8")
+    openspec = workspace / "openspec"
+    openspec.mkdir()
+    (openspec / "config.yaml").write_text(
+        "schema: agent-harness\n", encoding="utf-8"
+    )
+    change = openspec / "changes" / change_id
+    for relative, content in openspec_files().items():
+        target = change / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+
+
 def prepare_openspec_change(
     repo: TempRepo,
     change_id: str = "add-feature",
@@ -71,37 +133,10 @@ def prepare_openspec_change(
     git(repo.path, "commit", "-m", "initialize openspec")
 
     change = openspec / "changes" / change_id
-    change.mkdir(parents=True)
-    (change / ".openspec.yaml").write_text(
-        "schema: agent-harness\n", encoding="utf-8"
-    )
-    (change / "proposal.md").write_text(
-        "## Why\n\nNeed it.\n\n"
-        "## What Changes\n\nBehavior changes.\n\n"
-        "## Non-Goals\n\nNone.\n\n"
-        "## Impact\n\nRepository only.\n\n"
-        "## Open Questions\n\nNone.\n",
-        encoding="utf-8",
-    )
-    (change / "design.md").write_text(
-        "## Security and Data\n\nNo sensitive data.\n\n"
-        "## Failure and Recovery\n\nRetry is not needed.\n\n"
-        "## Operability\n\nNo runtime wiring.\n\n"
-        "## Compatibility\n\nBackward compatible.\n\n"
-        "## UI and Source Material\n\nNo UI.\n",
-        encoding="utf-8",
-    )
-    specs = change / "specs" / "feature"
-    specs.mkdir(parents=True)
-    (specs / "spec.md").write_text(
-        "## ADDED Requirements\n\n"
-        "### Requirement: Feature\n\nThe system MUST work.\n\n"
-        "#### Scenario: Success\n\n- **WHEN** requested\n- **THEN** it works\n",
-        encoding="utf-8",
-    )
-    (change / "tasks.md").write_text(
-        "## 1. Work\n\n- [ ] 1.1 Implement and verify\n", encoding="utf-8"
-    )
+    for relative, content in openspec_files().items():
+        target = change / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
     if commit:
         git(repo.path, "add", f"openspec/changes/{change_id}")
         git(repo.path, "commit", "-m", "add openspec change")

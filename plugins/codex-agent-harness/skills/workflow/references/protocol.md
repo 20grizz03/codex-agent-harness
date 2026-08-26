@@ -10,9 +10,24 @@ Use this protocol for one repository-changing task. The MCP server persists evid
 4. If the task must overlap files already modified by the user, stop before writing and report `needs_human`; continue only after the user resolves that ownership boundary.
 5. Call `check_runtime`. It must not invoke a model. A failed Claude check does not prevent Codex implementation, but the run cannot complete the independent-review gate.
 
-## 2. Approve the implementation plan
+## 2. Classify and approve the implementation plan
 
-Before the first repository edit, show one concise implementation plan covering the intended changes, checks, and important boundaries, then wait for approval. If the user already supplied a concrete plan and explicitly asked to implement it, that request is the approval; do not ask again.
+Before `create_run` and before the first repository edit, classify the task by behavior, not by the number of Jira issues or the length of the proposed plan.
+
+Use this direct workflow only for a narrow, unambiguous change whose observable result, affected area, important boundaries, and checks can be stated without choosing a new product or architectural contract. OpenSpec is mandatory when even one task changes any of these:
+
+- concurrency, ordering, isolation, or coordination between operations;
+- retry, timeout, recovery, or duplicate-processing behavior;
+- partial success, partial failure, error aggregation, or completion semantics;
+- idempotency, atomicity, consistency, security, sensitive-data handling, or compatibility;
+- behavior across multiple external integrations or repositories;
+- a material architectural choice or unresolved requirement.
+
+One ready Jira issue is not automatically simple. For example, “run Google, Facebook, and Yandex independently, retry failed work, preserve partial success, and aggregate errors and metrics” requires OpenSpec even if Jira contains it as one issue. Switch to `epic-workflow`, materialize and validate the local OpenSpec, and create a one-task campaign before its implementation run.
+
+For a direct task, show one concise plan that names the observable result, affected area, important non-goals or boundaries, and checks. Include failure and recovery behavior whenever they are relevant. A list of filenames or implementation steps alone is not an adequate plan.
+
+If the user already supplied a concrete plan and explicitly asked to implement it, that request is the approval; do not ask again. When OpenSpec is required, still materialize and show the equivalent artifacts before code, but wait again only if this exposes a new product decision or materially changes the approved contract.
 
 Approval authorizes reversible local edits, checks, corrections, and commits within that plan. Do not request separate permission to write code. Ask again only when the product contract or scope materially expands, the task overlaps user-owned dirty files, or an external or irreversible action is required.
 

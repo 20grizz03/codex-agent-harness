@@ -41,7 +41,7 @@ class McpContractTests(unittest.TestCase):
             self.assertFalse(tool["inputSchema"].get("additionalProperties", True))
             self.assertFalse(tool["annotations"]["destructiveHint"])
 
-    def test_create_campaign_exposes_bounded_openspec_reference(self) -> None:
+    def test_create_campaign_exposes_local_openspec_default(self) -> None:
         create_campaign = next(
             tool for tool in TOOLS if tool["name"] == "create_campaign"
         )
@@ -51,6 +51,9 @@ class McpContractTests(unittest.TestCase):
             "^[a-z0-9][a-z0-9-]*$",
             schema["properties"]["change_id"]["pattern"],
         )
+        storage = schema["properties"]["storage"]
+        self.assertEqual(["local", "repository"], storage["enum"])
+        self.assertEqual("local", storage["default"])
 
     def test_mcp_allowlist_matches_public_tool_surface(self) -> None:
         configuration = json.loads(

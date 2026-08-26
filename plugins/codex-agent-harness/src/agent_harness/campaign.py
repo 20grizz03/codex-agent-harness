@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from .contract import DEFAULT_FORBIDDEN_ACTIONS
-from .git_repo import RepoContext, resolve_repo, status_snapshot
+from .git_repo import RepoContext, resolve_repo, run_git, status_snapshot
 from .policy import validate_risk
 from .store import RunStore, SCHEMA_VERSION
 from .util import (
@@ -233,8 +233,10 @@ def _openspec_change_dir(
     return archived
 
 
-def _openspec_fingerprint(change_dir: Path) -> str:
-    files: list[Path] = []
+def _openspec_directory_files(change_dir: Path) -> dict[str, bytes]:
+    if change_dir.is_symlink() or not change_dir.is_dir():
+        raise InputError("OpenSpec change must be a real directory")
+    files: dict[str, bytes] = {}
     total_bytes = 0
     for path in sorted(
         change_dir.rglob("*"),
@@ -246,14 +248,21 @@ def _openspec_fingerprint(change_dir: Path) -> str:
             continue
         if not path.is_file():
             raise InputError("OpenSpec change contains a non-file entry")
-        files.append(path)
         total_bytes += path.stat().st_size
-        if len(files) > MAX_OPENSPEC_FILES or total_bytes > MAX_OPENSPEC_BYTES:
+        if len(files) >= MAX_OPENSPEC_FILES or total_bytes > MAX_OPENSPEC_BYTES:
             raise InputError("OpenSpec change is too large to freeze safely")
+        files[path.relative_to(change_dir).as_posix()] = path.read_bytes()
+    return files
 
-    relative_files = {
-        path.relative_to(change_dir).as_posix(): path for path in files
-    }
+
+def _openspec_fingerprint_files(relative_files: Mapping[str, bytes]) -> str:
+    total_bytes = sum(len(content) for content in relative_files.values())
+    if (
+        len(relative_files) > MAX_OPENSPEC_FILES
+        or total_bytes > MAX_OPENSPEC_BYTES
+    ):
+        raise InputError("OpenSpec change is too large to freeze safely")
+
     missing = [
         name
         for name in (".openspec.yaml", "proposal.md", "design.md", "tasks.md")
@@ -271,7 +280,7 @@ def _openspec_fingerprint(change_dir: Path) -> str:
             "OpenSpec change is incomplete; missing: " + ", ".join(missing)
         )
 
-    metadata = relative_files[".openspec.yaml"].read_bytes()
+    metadata = relative_files[".openspec.yaml"]
     if not OPENSPEC_SCHEMA_RE.search(metadata):
         raise InputError("OpenSpec change must use schema: agent-harness")
 
@@ -279,7 +288,10 @@ def _openspec_fingerprint(change_dir: Path) -> str:
         ("proposal.md", OPENSPEC_PROPOSAL_HEADINGS),
         ("design.md", OPENSPEC_DESIGN_HEADINGS),
     ):
-        content = relative_files[relative].read_text(encoding="utf-8")
+        try:
+            content = relative_files[relative].decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise InputError(f"OpenSpec {relative} must be valid UTF-8") from exc
         absent = [
             heading
             for heading in headings
@@ -293,10 +305,10 @@ def _openspec_fingerprint(change_dir: Path) -> str:
 
     digest = hashlib.sha256()
     digest.update(b"agent-harness-openspec-v1\0")
-    for relative, path in relative_files.items():
+    for relative in sorted(relative_files):
         digest.update(relative.encode("utf-8", errors="surrogateescape"))
         digest.update(b"\0")
-        content = path.read_bytes()
+        content = relative_files[relative]
         if relative == "tasks.md":
             content = OPENSPEC_CHECKBOX_RE.sub(rb"\1[ ]", content)
         digest.update(content)
@@ -304,13 +316,43 @@ def _openspec_fingerprint(change_dir: Path) -> str:
     return digest.hexdigest()
 
 
+def _openspec_fingerprint(change_dir: Path) -> str:
+    return _openspec_fingerprint_files(_openspec_directory_files(change_dir))
+
+
+def _require_ignored_openspec(context: RepoContext, change_dir: Path) -> None:
+    for path in (
+        context.repo_root / "openspec/config.yaml",
+        change_dir / ".openspec.yaml",
+    ):
+        relative = path.relative_to(context.repo_root).as_posix()
+        completed = run_git(
+            context.repo_root,
+            ["check-ignore", "--quiet", "--", relative],
+        )
+        if completed.returncode == 1:
+            raise InputError(
+                "local OpenSpec must be ignored by Git; add /openspec/ to "
+                ".git/info/exclude or .gitignore, or use storage=repository "
+                "for tracked OpenSpec"
+            )
+        if completed.returncode != 0:
+            raise InputError(
+                "unable to verify that local OpenSpec is ignored by Git"
+            )
+
+
 def _openspec_reference(
     value: Any,
     context: RepoContext,
-) -> dict[str, str] | None:
+) -> tuple[dict[str, str] | None, dict[str, bytes] | None]:
     if value is None:
-        return None
-    spec = _exact_object(value, "spec", allowed={"kind", "change_id"})
+        return None, None
+    spec = _exact_object(
+        value,
+        "spec",
+        allowed={"kind", "change_id", "storage"},
+    )
     kind = require_string(spec.get("kind"), "spec.kind", maximum=32)
     if kind != "openspec":
         raise InputError("spec.kind must be openspec")
@@ -319,32 +361,45 @@ def _openspec_reference(
     )
     if not OPENSPEC_CHANGE_RE.fullmatch(change_id):
         raise InputError("spec.change_id must be lowercase kebab-case")
+    storage = require_string(
+        spec.get("storage", "local"), "spec.storage", maximum=32
+    )
+    if storage not in {"local", "repository"}:
+        raise InputError("spec.storage must be local or repository")
     change_dir = _openspec_change_dir(
         context,
         change_id,
         allow_archive=False,
     )
+    files = _openspec_directory_files(change_dir)
+    if storage == "local":
+        _require_ignored_openspec(context, change_dir)
 
-    return {
-        "kind": kind,
-        "change_id": change_id,
-        "path": change_dir.relative_to(context.repo_root).as_posix(),
-        "sha256": _openspec_fingerprint(change_dir),
-    }
+    return (
+        {
+            "kind": kind,
+            "change_id": change_id,
+            "storage": storage,
+            "path": change_dir.relative_to(context.repo_root).as_posix(),
+            "sha256": _openspec_fingerprint_files(files),
+        },
+        files if storage == "local" else None,
+    )
 
 
 def verify_openspec_reference(
     contract: Mapping[str, Any],
     context: RepoContext,
+    local_spec_dir: Path | None = None,
 ) -> None:
     reference = contract.get("spec")
     if reference is None:
         return
-    if not isinstance(reference, Mapping) or set(reference) != {
-        "kind",
-        "change_id",
-        "path",
-        "sha256",
+    old_fields = {"kind", "change_id", "path", "sha256"}
+    new_fields = {*old_fields, "storage"}
+    if not isinstance(reference, Mapping) or frozenset(reference) not in {
+        frozenset(old_fields),
+        frozenset(new_fields),
     }:
         raise StateError("campaign OpenSpec reference is corrupt")
     try:
@@ -352,22 +407,50 @@ def verify_openspec_reference(
         change_id = require_string(
             reference.get("change_id"), "spec.change_id", maximum=128
         )
+        storage = require_string(
+            reference.get("storage", "repository"),
+            "spec.storage",
+            maximum=32,
+        )
         expected_path = f"openspec/changes/{change_id}"
         if (
             kind != "openspec"
             or not OPENSPEC_CHANGE_RE.fullmatch(change_id)
+            or storage not in {"local", "repository"}
             or reference.get("path") != expected_path
         ):
             raise InputError("invalid stored OpenSpec reference")
-        change_dir = _openspec_change_dir(
-            context,
-            change_id,
-            allow_archive=True,
-        )
-        current = _openspec_fingerprint(change_dir)
+        if storage == "local":
+            if local_spec_dir is None:
+                raise InputError("local OpenSpec snapshot path is unavailable")
+            snapshot = _openspec_fingerprint(local_spec_dir)
+            repo_root = require_string(
+                contract.get("repo_root"), "repo_root", maximum=4_096
+            )
+            spec_context = resolve_repo(repo_root)
+            if spec_context.git_common_dir != context.git_common_dir:
+                raise InputError(
+                    "campaign OpenSpec belongs to a different Git repository"
+                )
+            change_dir = _openspec_change_dir(
+                spec_context,
+                change_id,
+                allow_archive=False,
+            )
+            _require_ignored_openspec(spec_context, change_dir)
+            current = _openspec_fingerprint(change_dir)
+        else:
+            change_dir = _openspec_change_dir(
+                context,
+                change_id,
+                allow_archive=True,
+            )
+            current = _openspec_fingerprint(change_dir)
     except InputError as exc:
         raise StateError(f"cannot verify approved OpenSpec change: {exc}") from exc
-    if reference.get("sha256") != current:
+    if reference.get("sha256") != current or (
+        storage == "local" and reference.get("sha256") != snapshot
+    ):
         raise StateError(
             "OpenSpec change differs from the approved campaign specification"
         )
@@ -492,7 +575,7 @@ def _tasks(value: Any) -> list[dict[str, Any]]:
 def build_campaign(
     arguments: Mapping[str, Any],
     context: RepoContext,
-) -> tuple[dict[str, Any], dict[str, Any]]:
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, bytes] | None]:
     _exact_object(
         arguments,
         "campaign",
@@ -520,7 +603,7 @@ def build_campaign(
         raise InputError("cutoff_at is only valid for replay campaigns")
     if mode == "replay" and arguments.get("spec") is not None:
         raise InputError("spec is only valid for delivery campaigns")
-    spec = _openspec_reference(arguments.get("spec"), context)
+    spec, spec_files = _openspec_reference(arguments.get("spec"), context)
     risk = validate_risk(arguments.get("risk", "high"))
 
     now = utc_now()
@@ -576,6 +659,15 @@ def build_campaign(
                 "campaign workspace is dirty; use an isolated worktree before "
                 f"creating the campaign ({paths}{suffix})"
             )
+        if spec.get("storage") != "repository":
+            paths = ", ".join(
+                str(path) for path in initial_worktree["paths"][:8]
+            )
+            suffix = " ..." if len(initial_worktree["paths"]) > 8 else ""
+            raise InputError(
+                "campaign workspace is dirty; use an isolated worktree before "
+                f"creating the campaign ({paths}{suffix})"
+            )
         spec_prefix = f"{spec['path']}/"
         unrelated = [
             str(path)
@@ -596,6 +688,7 @@ def build_campaign(
         "workspace": str(context.workspace),
         "repo_root": str(context.repo_root),
         "git_dir": str(context.git_dir),
+        "git_common_dir": str(context.git_common_dir),
         "base_sha": context.head_sha,
         "initial_worktree": initial_worktree,
         "title": _sanitized_string(
@@ -669,7 +762,7 @@ def build_campaign(
         "candidate": None,
         "terminal": None,
     }
-    return contract, state
+    return contract, state, spec_files
 
 
 class CampaignStore:
@@ -677,7 +770,9 @@ class CampaignStore:
 
     def __init__(self, context: RepoContext) -> None:
         self.context = context
-        self.root = context.git_dir / "codex-agent-harness" / "campaigns"
+        self.root = context.git_common_dir / "codex-agent-harness" / "campaigns"
+        legacy_root = context.git_dir / "codex-agent-harness" / "campaigns"
+        self.legacy_root = legacy_root if legacy_root != self.root else None
 
     @classmethod
     def for_workspace(cls, workspace: str | Path) -> "CampaignStore":
@@ -693,14 +788,54 @@ class CampaignStore:
     def campaign_dir(self, campaign_id: str) -> Path:
         if not CAMPAIGN_ID_RE.fullmatch(campaign_id):
             raise StateError("invalid campaign_id")
-        path = self.root / campaign_id
+        root = self.root
+        if self.legacy_root is not None and not (root / campaign_id).exists():
+            legacy = self.legacy_root / campaign_id
+            if legacy.is_dir():
+                root = self.legacy_root
+        path = root / campaign_id
         try:
-            path.resolve().relative_to(self.root.resolve())
+            path.resolve().relative_to(root.resolve())
         except ValueError as exc:
             raise StateError("campaign path escaped the state root") from exc
         return path
 
-    def create(self, contract: dict[str, Any], state: dict[str, Any]) -> None:
+    def spec_dir(self, campaign_id: str) -> Path:
+        return self.campaign_dir(campaign_id) / "spec"
+
+    @staticmethod
+    def _create_bytes(path: Path, content: bytes) -> None:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(descriptor, "wb", closefd=False) as stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+        finally:
+            os.close(descriptor)
+        os.chmod(path, 0o600)
+
+    def _create_spec(self, campaign_id: str, files: Mapping[str, bytes]) -> None:
+        root = self.spec_dir(campaign_id)
+        root.mkdir(mode=0o700)
+        os.chmod(root, 0o700)
+        for relative, content in sorted(files.items()):
+            target = root / relative
+            target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            parent = target.parent
+            while parent != root.parent:
+                os.chmod(parent, 0o700)
+                if parent == root:
+                    break
+                parent = parent.parent
+            self._create_bytes(target, content)
+
+    def create(
+        self,
+        contract: dict[str, Any],
+        state: dict[str, Any],
+        spec_files: Mapping[str, bytes] | None = None,
+    ) -> None:
         self._ensure_root()
         campaign_id = str(contract["campaign_id"])
         directory = self.campaign_dir(campaign_id)
@@ -709,6 +844,8 @@ class CampaignStore:
         except FileExistsError as exc:
             raise StateError("campaign_id already exists") from exc
         os.chmod(directory, 0o700)
+        if spec_files is not None:
+            self._create_spec(campaign_id, spec_files)
         RunStore._create_json(directory / "contract.json", contract)
         RunStore._create_json(directory / "state.json", state)
         RunStore._create_json(
@@ -789,13 +926,16 @@ class CampaignStore:
         os.chmod(path, 0o600)
 
     def list_campaign_ids(self) -> Iterable[str]:
-        if not self.root.is_dir():
-            return []
+        roots = [self.root]
+        if self.legacy_root is not None:
+            roots.append(self.legacy_root)
         return sorted(
-            (
+            {
                 child.name
-                for child in self.root.iterdir()
+                for root in roots
+                if root.is_dir()
+                for child in root.iterdir()
                 if child.is_dir() and CAMPAIGN_ID_RE.fullmatch(child.name)
-            ),
+            },
             reverse=True,
         )

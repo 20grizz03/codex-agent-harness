@@ -7,6 +7,8 @@ description: Run every repository-mutating coding task through a durable Codex-l
 
 Codex remains the user-facing lead and default writer. Apply repository-specific coding or review skills inside this workflow when they match the task.
 
+Before creating a run, classify whether the task is a narrow direct change or needs an approved OpenSpec. A single Jira issue can still require OpenSpec when it changes concurrency, retries, partial-failure behavior, consistency, or several external integrations. In that case switch to `epic-workflow` before `create_run`; do not let a short plan bypass decomposition.
+
 When an `epic-workflow` campaign is active, this skill owns exactly one implementation task. Return its terminal `run_id` to the campaign instead of expanding into sibling tasks.
 
 Before changing files, read [references/protocol.md](references/protocol.md) completely and follow it. Use the `agent-harness` MCP tools to persist the task contract and evidence. The Codex lead owns state tools; delegate `start_stage`, `poll_stage`, and `cancel_stage` to one native tracking subagent so model-backed work remains visibly separate.

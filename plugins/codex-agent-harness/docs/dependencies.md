@@ -36,7 +36,7 @@ Its absence does not break the Agent Harness MCP server, but the setup audit rep
 
 ## OpenSpec decomposition
 
-[OpenSpec](https://github.com/Fission-AI/OpenSpec) is the required planning layer before implementing large ideas, high-risk changes, ambiguous changes, and multi-task epics. Agent Harness continues to own execution state, checks, worktrees, and review. A ready single Jira task does not require OpenSpec.
+[OpenSpec](https://github.com/Fission-AI/OpenSpec) is the required planning layer before implementing large ideas, high-risk or ambiguous changes, multi-task epics, and single tasks that change concurrency, retry or recovery, partial-failure semantics, consistency, security-sensitive data, compatibility, or multiple external integrations. Agent Harness continues to own execution state, checks, worktrees, and review. A narrow, unambiguous single task can use the direct workflow without OpenSpec.
 
 OpenSpec currently requires Node.js 20.19.0 or newer. Install the CLI separately:
 
@@ -52,7 +52,9 @@ cp -R plugins/codex-agent-harness/skills/epic-workflow/assets/openspec-schema/ag
 env OPENSPEC_TELEMETRY=0 openspec schema validate agent-harness
 ```
 
-Initialize each target repository only when its owners want versioned specs:
+By default, keep `/openspec` in the target project but add `/openspec/` to the repository's local `.git/info/exclude` before creating files. Agent Harness requires the directory to be ignored and snapshots the approved change in private Git metadata. This local mode does not require `openspec init`.
+
+Initialize a target repository only when its owners explicitly want versioned specs:
 
 ```bash
 env OPENSPEC_TELEMETRY=0 openspec init

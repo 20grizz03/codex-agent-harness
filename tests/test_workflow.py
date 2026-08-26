@@ -64,6 +64,89 @@ def wait_for_stage(
 
 
 class CodexWriterWorkflowTests(unittest.TestCase):
+    def test_late_stage_completion_preserves_explicit_run_terminal(self) -> None:
+        with _support.TempRepo() as repo, tempfile.TemporaryDirectory() as directory:
+            service = self._service(Path(directory))
+            run_id = service.create_run(
+                {
+                    "workspace": str(repo.path),
+                    "goal": "Update docs",
+                    "done_when": ["Docs are current"],
+                }
+            )["contract"]["run_id"]
+            store = RunStore.for_workspace(repo.path)
+            stage_id = f"{run_id}:critic:1"
+            state = store.read_state(run_id)
+            state["phase"] = "interrupted"
+            state["terminal"] = {
+                "status": "interrupted",
+                "summary": "User stopped the run",
+            }
+            state["stages"] = {
+                stage_id: {
+                    "profile": "critic",
+                    "lifecycle_state": "running",
+                    "error": "stale recovery error",
+                }
+            }
+            store.save_state(run_id, state)
+
+            service._on_stage_terminal(
+                str(repo.path),
+                run_id,
+                stage_id,
+                {
+                    "lifecycle_state": "completed",
+                    "result": _support.PASS_REVIEW,
+                    "telemetry": {},
+                },
+            )
+
+            persisted = store.read_state(run_id)
+            self.assertEqual("interrupted", persisted["phase"])
+            self.assertEqual("User stopped the run", persisted["terminal"]["summary"])
+            self.assertEqual(
+                "completed", persisted["stages"][stage_id]["lifecycle_state"]
+            )
+            self.assertNotIn("error", persisted["stages"][stage_id])
+            self.assertIsNone(store.read_review(run_id)["review"])
+
+    def test_finish_run_rejects_an_active_model_stage(self) -> None:
+        with _support.TempRepo() as repo, tempfile.TemporaryDirectory() as directory:
+            service = self._service(Path(directory), FAKE_CLAUDE_MODE="hang")
+            run_id = service.create_run(
+                {
+                    "workspace": str(repo.path),
+                    "goal": "Update docs",
+                    "done_when": ["Docs are current"],
+                }
+            )["contract"]["run_id"]
+            (repo.path / "README.md").write_text("changed\n", encoding="utf-8")
+            run_planned_checks(service, repo.path, run_id)
+            started = service.start_stage(
+                {
+                    "workspace": str(repo.path),
+                    "run_id": run_id,
+                    "profile": "critic",
+                }
+            )
+
+            with self.assertRaisesRegex(StateError, "cancel_stage"):
+                service.finish_run(
+                    {
+                        "workspace": str(repo.path),
+                        "run_id": run_id,
+                        "status": "interrupted",
+                    }
+                )
+            service.cancel_stage(
+                {
+                    "workspace": str(repo.path),
+                    "run_id": run_id,
+                    "stage_id": started["stage_id"],
+                }
+            )
+
     def test_high_risk_review_focus_uses_escalated_state_risk(self) -> None:
         prompt = build_stage_prompt(
             profile="critic",
@@ -232,7 +315,11 @@ class CodexWriterWorkflowTests(unittest.TestCase):
                     "done_when": ["All tasks are reviewed"],
                     "source": {"kind": "local", "ref": "cooldown-test"},
                     "risk": "medium",
-                    "spec": {"kind": "openspec", "change_id": "add-feature"},
+                    "spec": {
+                        "kind": "openspec",
+                        "change_id": "add-feature",
+                        "storage": "repository",
+                    },
                     "tasks": tasks,
                 }
             )

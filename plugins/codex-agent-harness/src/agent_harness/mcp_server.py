@@ -16,8 +16,9 @@ SERVER_NAME = "agent-harness"
 SERVER_INSTRUCTIONS = (
     "Codex owns epic campaign state, task state, and deterministic checks. "
     "Campaign completion is local and never authorizes tracker or GitHub writes. "
-    "Approved OpenSpec references are semantically fingerprinted and rechecked "
-    "by the server and never replace campaign execution state. "
+    "Approved OpenSpec references are semantically fingerprinted and rechecked; "
+    "local mode requires an ignored project /openspec and keeps a private snapshot. "
+    "OpenSpec never replaces campaign execution state. "
     "A replay candidate must be sealed before historical evidence is compared. "
     "Model-backed lifecycle "
     "tools start_stage, poll_stage, and cancel_stage are proxy-only: call them "
@@ -142,6 +143,15 @@ CAMPAIGN_SPEC_SCHEMA = {
             "maxLength": 128,
             "pattern": "^[a-z0-9][a-z0-9-]*$",
         },
+        "storage": {
+            "type": "string",
+            "enum": ["local", "repository"],
+            "default": "local",
+            "description": (
+                "Local requires ignored project files and stores a private snapshot; "
+                "repository explicitly uses versioned openspec/changes/<change-id>."
+            ),
+        },
     },
     "additionalProperties": False,
 }
@@ -232,7 +242,8 @@ TOOLS: list[dict[str, Any]] = [
         "name": "create_campaign",
         "description": (
             "Freeze one local epic campaign with ordered tasks and a server-fingerprinted "
-            "OpenSpec change required for high-risk or multi-task delivery. Replay campaigns freeze a "
+            "OpenSpec snapshot required for high-risk or multi-task delivery. Ignored project "
+            "storage is the default; versioned repository storage is explicit. Replay campaigns freeze a "
             "cutoff and withheld-evidence categories. Does not read or change Jira "
             "or GitHub."
         ),
