@@ -4,14 +4,14 @@
 
 The plugin includes delivery-writing conventions: compact Jira tasks, post-implementation testing recommendations, one- or two-sentence PR descriptions, natural Russian technical prose, and concise colleague-facing review comments. Drafting text does not authorize changing Jira or publishing to GitHub. Large ideas, high-risk or ambiguous changes, live multi-task epics, and behaviorally complex single tasks keep their approved decomposition in OpenSpec; Agent Harness remains the execution and evidence layer.
 
-Version 2.1 can read Jira epics and GitHub Enterprise delivery state through connectors already available to Codex. It can assign up to three dependency-free tasks to separate Codex subagents. Sequential tasks use clean chained commits, while a dedicated integration task rechecks and reviews the combined repository result. Every task keeps its own review. Claude remains the default critic; a confirmed Anthropic usage limit opens a campaign cooldown with one later recovery probe and explicit `codex_fallback` reviews meanwhile. Other Claude failures do not trigger retries or fallback.
+Version 2.1 can read Jira epics and GitHub Enterprise delivery state through connectors already available to Codex. It can assign up to three dependency-free tasks to separate Codex subagents. Sequential tasks use clean chained commits, while a dedicated integration task rechecks and reviews the combined repository result. Every task keeps its own review. As soon as an independent PR or Jira result is locally complete, it moves to a fresh user-visible publication task while the epic continues; that task stays with the delivery through CI, review feedback, and deployment diagnosis. Publication waits for the shown package and `публикуем`. Claude remains the default critic; a confirmed Anthropic usage limit opens a campaign cooldown with one later recovery probe and explicit `codex_fallback` reviews meanwhile. Other Claude failures do not trigger retries or fallback.
 
 ## Skills
 
 - `workflow` runs repository mutations through the durable Codex-led cycle.
 - `review` obtains and verifies an independent read-only review.
 - `setup` checks the Claude subscription runtime without model inference.
-- `delivery-writing` prepares Jira tasks, post-implementation testing recommendations, concise PR descriptions, and review comments without publishing them.
+- `delivery-writing` prepares Jira tasks, testing recommendations, PR descriptions, and review comments. Drafting alone never publishes them; a separate publication task may execute only its shown package after `публикуем`.
 - `epic-workflow` decomposes an epic into durable v1 runs and can perform a blind replay of a closed epic before comparing with historical Jira, PR, and Git evidence.
 
 ## Install on another computer

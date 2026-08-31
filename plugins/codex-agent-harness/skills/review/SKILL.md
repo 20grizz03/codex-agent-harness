@@ -7,7 +7,7 @@ description: Independently review a repository diff with a fresh read-only Claud
 
 Codex owns the review target, final judgment, and user-facing report. Read [references/review-contract.md](references/review-contract.md) completely before invoking the critic.
 
-Create a run if the review is not already part of an active workflow. Record applicable deterministic checks first. Delegate the model lifecycle to one native tracking subagent; Claude must use the read-only `critic` profile and inspect the repository itself.
+Create a run if the review is not already part of an active workflow. Record applicable deterministic checks first. Prefer delegating the model lifecycle to one native tracking subagent. Its task must forbid starting any MCP server or process, including `scripts/mcp_server.py`, and require `lifecycle tools unavailable` without side effects when plugin lifecycle tools are absent. The Codex instance that owns the run then calls them through its already configured `agent-harness` MCP server; never start another MCP server or process for the same run. Claude must use the read-only `critic` profile and inspect the repository itself; Codex receives only sanitized progress and the structured result.
 
 If the persisted Claude stage reports `failure_kind: anthropic_limit`, do not retry it. Use one fresh native Codex subagent with no inherited task conversation as the read-only fallback reviewer, then submit the same structured contract through `record_review_resolution`. Disclose origin `codex_fallback`. For every other Claude failure, leave the review gate unclosed.
 

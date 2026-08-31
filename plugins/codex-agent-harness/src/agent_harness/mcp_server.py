@@ -20,9 +20,10 @@ SERVER_INSTRUCTIONS = (
     "local mode requires an ignored project /openspec and keeps a private snapshot. "
     "OpenSpec never replaces campaign execution state. "
     "A replay candidate must be sealed before historical evidence is compared. "
-    "Model-backed lifecycle "
-    "tools start_stage, poll_stage, and cancel_stage are proxy-only: call them "
-    "from one native tracking subagent, not from the user-facing lead. The "
+    "Prefer calling model-backed lifecycle tools start_stage, poll_stage, and "
+    "cancel_stage from one native tracking subagent. If plugin tools are unavailable "
+    "there, the user-facing lead calls them through this already configured MCP "
+    "server; never launch another MCP server for the same run. The "
     "critic profile is read-only. The implement profile requires explicit "
     "Claude writer authority in the immutable run contract. A confirmed "
     "Anthropic critic limit permits an explicit Codex fallback review and opens "
@@ -677,10 +678,12 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "start_stage",
         "description": (
-            "PROXY-ONLY: start the single Claude critic or explicitly authorized "
+            "Start the single Claude critic or explicitly authorized "
             "Claude implementation stage. Subscription readiness and green-check "
             "gates are enforced before inference; a campaign cooldown may skip Claude "
-            "and enable the explicit Codex fallback. Never call from the Codex lead."
+            "and enable the explicit Codex fallback. Prefer a native tracking subagent; "
+            "if plugin tools are unavailable there, the Codex lead may call through "
+            "this same configured MCP server. Never launch a second server for the run."
         ),
         "inputSchema": {
             "type": "object",
@@ -699,8 +702,10 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "poll_stage",
         "description": (
-            "PROXY-ONLY: read allowlisted progress and terminal metadata for one "
-            "Claude stage. Raw JSONL, prompts, tool arguments, and stderr are discarded."
+            "Read allowlisted progress and terminal metadata for one Claude stage. "
+            "Prefer the tracking subagent that started it; otherwise poll through the "
+            "same configured MCP server. Raw JSONL, prompts, tool arguments, and stderr "
+            "are discarded."
         ),
         "inputSchema": {
             "type": "object",
@@ -720,8 +725,9 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "cancel_stage",
         "description": (
-            "PROXY-ONLY: cancel one active Claude stage without retrying or "
-            "starting a replacement. Never call from the Codex lead."
+            "Cancel one active Claude stage without retrying or starting a replacement. "
+            "Prefer its tracking subagent; otherwise cancel through the same configured "
+            "MCP server. Never launch a second server for the run."
         ),
         "inputSchema": {
             "type": "object",

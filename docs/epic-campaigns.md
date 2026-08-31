@@ -19,7 +19,7 @@ Campaign state and the approved local OpenSpec snapshot are private Git metadata
 
 The contract freezes the source reference, goal, constraints, ordered tasks, risk, runtime version, and forbidden actions. A campaign-linked v1 run inherits at least that risk and records its own runtime version, base SHA, final HEAD, and diff fingerprint. An OpenSpec reference contains only its storage mode, change ID, repository-relative path, and a server-computed semantic SHA-256. The default `local` mode requires `/openspec` to be ignored by Git and privately snapshots the approved change; task transitions verify both copies. The explicit `repository` mode preserves versioned OpenSpec projects and accepts old references without a storage field. The custom schema requires behavior plus security/data, failure/recovery, operability, compatibility, and UI/source-material decisions. Checkbox state is normalized, while any other content change blocks task progress and candidate sealing. `state.json` tracks task status, provider cooldown, runtime-version checkpoints, sanitized human interventions, operational transition counts, and the sealed candidate.
 
-The state path is `prepared → executing → candidate_ready → comparing → complete`. Normal delivery skips `comparing`. Terminal alternatives are `needs_human`, `blocked`, `failed`, and `interrupted`.
+The state path is `prepared → executing → candidate_ready → comparing → complete`. Normal delivery skips `comparing`. Terminal alternatives are `needs_human`, `blocked`, `failed`, and `interrupted`. Integration-dependent implementation tasks remain internal until their combined run completes.
 
 ## MCP tools
 
@@ -31,6 +31,12 @@ The state path is `prepared → executing → candidate_ready → comparing → 
 - `finish_campaign` reports `evaluated` for replay and `locally_ready` for delivery. Its result never authorizes Jira, GitHub, deployment, or migration actions.
 
 Campaign-linked model stages share an Anthropic cooldown. During the interval the server does not invoke Claude: a critic gets an explicit limit terminal that enables the bounded Codex fallback, while an explicitly selected Claude implementation ends as an operational failure without fallback. After expiry exactly one next model stage probes Claude; a successful probe closes the circuit and another confirmed limit extends it. The default interval is one hour and can be changed with `AGENT_HARNESS_ANTHROPIC_COOLDOWN_SECONDS` from 1 to 14,400 seconds. Plugin upgrades are allowed between task waves with no active probe, and every run retains the version with which it started; a detectable downgrade is rejected.
+
+## Publication handoff
+
+As soon as an independently publishable Jira task completes its run, it moves to a fresh user-visible Codex publication task with a compact verified handoff; sibling tasks and the campaign may continue in parallel. Several implementation tasks that intentionally share one pull request wait only for their integration run, not for campaign completion. A campaign task of kind `delivery` prepares only this handoff; it does not duplicate the final publication text. The publication task is created only when the approved implementation plan explicitly included it.
+
+The handoff contains campaign and run IDs, current diff fingerprint, repository, immutable candidate worktree, SHA, branch and remote references, changed paths, check and review summaries, residual risks, and proposed external actions; it does not inherit the epic conversation or raw logs. The fresh task verifies persisted Agent Harness evidence and reads the candidate diff itself before preparing the implementation summary, PR description, and Jira testing recommendations. A campaign never hands off an uncommitted shared worktree that active runs can mutate. After the complete package is shown, `публикуем` authorizes only the listed local branch or commit, push, PR, and publication of the shown Jira testing-recommendations block. The same publication task then owns CI, review feedback, deployment status, and deployment-failure diagnosis for that Jira task; it does not create another user-visible task.
 
 ## Jira and GitHub Enterprise
 
