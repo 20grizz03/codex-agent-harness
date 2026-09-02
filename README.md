@@ -23,13 +23,6 @@ codex plugin marketplace add 20grizz03/codex-agent-harness --ref main
 codex plugin add codex-agent-harness@agent-harness-local
 ```
 
-Ponytail is the default companion skill for keeping implementations small:
-
-```bash
-codex plugin marketplace add https://github.com/DietrichGebert/ponytail.git
-codex plugin add ponytail@ponytail
-```
-
 Claude inference is subscription-only. Authenticate interactively when needed:
 
 ```bash
@@ -38,7 +31,7 @@ claude auth login
 
 Start a new Codex task after installation so the skills and MCP tools are discovered from the installed snapshot. Ask Codex to check Agent Harness setup; the check does not invoke a model or install anything.
 
-See [`plugins/codex-agent-harness/docs/dependencies.md`](plugins/codex-agent-harness/docs/dependencies.md) for the complete runtime, optional OpenSpec setup, companion-skill, connector, and development-tool inventory bundled with the plugin.
+See [`plugins/codex-agent-harness/docs/dependencies.md`](plugins/codex-agent-harness/docs/dependencies.md) for the complete runtime, optional OpenSpec setup, connector, and development-tool inventory bundled with the plugin.
 
 ## Install from a local checkout
 

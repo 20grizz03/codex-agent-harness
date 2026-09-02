@@ -23,17 +23,6 @@ These components are required for a complete implementation run:
 
 Claude must use first-party subscription OAuth. `check_runtime` rejects API keys, custom Anthropic endpoints, Bedrock, Vertex, and Foundry routing and never invokes a model itself.
 
-## Default companion
-
-[Ponytail](https://github.com/DietrichGebert/ponytail) is installed separately and is expected by default for repository-changing tasks:
-
-```bash
-codex plugin marketplace add https://github.com/DietrichGebert/ponytail.git
-codex plugin add ponytail@ponytail
-```
-
-Its absence does not break the Agent Harness MCP server, but the setup audit reports that the default minimal-implementation profile is incomplete.
-
 ## OpenSpec decomposition
 
 [OpenSpec](https://github.com/Fission-AI/OpenSpec) is the required planning layer before implementing large ideas, high-risk or ambiguous changes, multi-task epics, and single tasks that change concurrency, retry or recovery, partial-failure semantics, consistency, security-sensitive data, compatibility, or multiple external integrations. Agent Harness continues to own execution state, checks, worktrees, and review. A narrow, unambiguous single task can use the direct workflow without OpenSpec.
