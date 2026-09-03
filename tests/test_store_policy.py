@@ -10,7 +10,7 @@ from pathlib import Path
 import _support
 
 from agent_harness.contract import build_contract
-from agent_harness.git_repo import diff_fingerprint, resolve_repo
+from agent_harness.git_repo import diff_fingerprint, diff_stats, resolve_repo
 from agent_harness.policy import plan_checks, validate_checks
 from agent_harness.service import HarnessService
 from agent_harness.store import RunStore
@@ -18,6 +18,92 @@ from agent_harness.util import InputError, StateError
 
 
 class GitFingerprintTests(unittest.TestCase):
+    def test_diff_stats_classify_text_generated_tests_and_binary(self) -> None:
+        with _support.TempRepo() as repo:
+            files = {
+                "src/app.py": "one\ntwo\nthree\n",
+                "src/unknown.odd": "one\ntwo\n",
+                "tests/test_app.py": "one\ntwo\nthree\nfour\n",
+                "docs/guide.md": "one\ntwo\n",
+                "composer.lock": "one\ntwo\nthree\n",
+                "go.mod": "module example.com/service\ngo 1.24\n",
+                "Jenkinsfile": "pipeline {}\n",
+                "src/api.pb.cc": "one\ntwo\n",
+                "src/api.pb.h": "one\n",
+                "artifact.out": "one\ntwo\n",
+                ".gitattributes": "artifact.out linguist-generated\n",
+            }
+            for relative, content in files.items():
+                path = repo.path / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content, encoding="utf-8")
+            (repo.path / "image.bin").write_bytes(b"one\x00two")
+
+            statistics = diff_stats(resolve_repo(repo.path))
+
+            self.assertEqual(5, statistics["production"]["total"])
+            self.assertEqual(4, statistics["tests"]["total"])
+            self.assertEqual(2, statistics["documentation"]["total"])
+            self.assertEqual(4, statistics["configuration"]["total"])
+            self.assertEqual(8, statistics["generated"]["total"])
+            self.assertEqual(1, statistics["binary"]["files"])
+            categories = {
+                item["path"]: item["category"] for item in statistics["paths"]
+            }
+            self.assertEqual("generated", categories["artifact.out"])
+            self.assertEqual("generated", categories["src/api.pb.cc"])
+            self.assertEqual("generated", categories["src/api.pb.h"])
+            self.assertEqual("configuration", categories[".gitattributes"])
+            self.assertEqual("configuration", categories["go.mod"])
+            self.assertEqual("configuration", categories["Jenkinsfile"])
+
+    def test_diff_stats_count_tracked_deletions_and_rename_destination(self) -> None:
+        with _support.TempRepo() as repo:
+            source = repo.path / "src"
+            source.mkdir()
+            (source / "old.py").write_text("one\ntwo\nthree\n", encoding="utf-8")
+            (source / "remove.py").write_text("one\ntwo\n", encoding="utf-8")
+            _support.git(repo.path, "add", "src")
+            _support.git(repo.path, "commit", "-m", "add source")
+            base_sha = resolve_repo(repo.path).head_sha
+            _support.git(repo.path, "mv", "src/old.py", "src/new.py")
+            (source / "remove.py").unlink()
+
+            statistics = diff_stats(resolve_repo(repo.path), base_sha=base_sha)
+
+            self.assertEqual(2, statistics["production"]["deleted"])
+            paths = {item["path"] for item in statistics["paths"]}
+            self.assertIn("src/new.py", paths)
+            self.assertNotIn("src/old.py", paths)
+
+    def test_deleted_and_renamed_generated_files_use_base_attributes(self) -> None:
+        with _support.TempRepo() as repo:
+            generated = repo.path / "generated"
+            generated.mkdir()
+            (repo.path / ".gitattributes").write_text(
+                "generated/*.odd linguist-generated\n",
+                encoding="utf-8",
+            )
+            (generated / "deleted.odd").write_text("one\ntwo\n", encoding="utf-8")
+            (generated / "old.odd").write_text("one\n", encoding="utf-8")
+            _support.git(repo.path, "add", ".gitattributes", "generated")
+            _support.git(repo.path, "commit", "-m", "add generated fixtures")
+            base_sha = resolve_repo(repo.path).head_sha
+            (repo.path / ".gitattributes").unlink()
+            (generated / "deleted.odd").unlink()
+            _support.git(repo.path, "mv", "generated/old.odd", "renamed.odd")
+
+            statistics = diff_stats(resolve_repo(repo.path), base_sha=base_sha)
+
+            self.assertEqual(2, statistics["generated"]["files"])
+            self.assertEqual(2, statistics["generated"]["deleted"])
+            categories = {
+                item["path"]: item["category"] for item in statistics["paths"]
+            }
+            self.assertEqual("generated", categories["generated/deleted.odd"])
+            self.assertEqual("generated", categories["renamed.odd"])
+            self.assertEqual("configuration", categories[".gitattributes"])
+
     def test_fingerprint_tracks_tracked_and_untracked_content(self) -> None:
         with _support.TempRepo() as repo:
             context = resolve_repo(repo.path)
@@ -87,6 +173,89 @@ class GitFingerprintTests(unittest.TestCase):
 
 
 class StoreTests(unittest.TestCase):
+    def test_new_run_freezes_default_review_budget(self) -> None:
+        with _support.TempRepo() as repo:
+            run = HarnessService({}).create_run(
+                {
+                    "workspace": str(repo.path),
+                    "goal": "Update code",
+                    "done_when": ["Code is current"],
+                }
+            )
+            self.assertEqual(
+                {
+                    "expected_production_lines": {"min": 0, "max": 700},
+                    "max_production_lines": 700,
+                    "exception_reason": None,
+                },
+                run["contract"]["review_budget"],
+            )
+            self.assertEqual("advisory", run["contract"]["review_budget_mode"])
+
+    def test_expected_overage_requires_reason_but_not_high_risk(
+        self,
+    ) -> None:
+        with _support.TempRepo() as repo:
+            service = HarnessService({})
+            with self.assertRaisesRegex(InputError, "requires exception_reason"):
+                service.create_run(
+                    {
+                        "workspace": str(repo.path),
+                        "goal": "Upgrade runtime",
+                        "done_when": ["Runtime works"],
+                        "review_budget": {
+                            "expected_production_lines": {"min": 800, "max": 900}
+                        },
+                    }
+                )
+            run = service.create_run(
+                {
+                    "workspace": str(repo.path),
+                    "goal": "Upgrade runtime",
+                    "done_when": ["Runtime works"],
+                    "risk": "medium",
+                    "review_budget": {
+                        "expected_production_lines": {"min": 800, "max": 900},
+                        "exception_reason": "Intermediate states do not build",
+                    },
+                }
+            )
+            self.assertEqual(
+                "Intermediate states do not build",
+                run["contract"]["review_budget"]["exception_reason"],
+            )
+
+    def test_legacy_run_measurement_is_report_only_and_read_only(self) -> None:
+        with _support.TempRepo() as repo:
+            service = HarnessService({})
+            run = service.create_run(
+                {
+                    "workspace": str(repo.path),
+                    "goal": "Update code",
+                    "done_when": ["Code is current"],
+                }
+            )
+            run_id = run["contract"]["run_id"]
+            store = RunStore.for_workspace(repo.path)
+            contract_path = store.run_dir(run_id) / "contract.json"
+            contract = json.loads(contract_path.read_text(encoding="utf-8"))
+            contract.pop("review_budget")
+            contract.pop("review_budget_mode")
+            contract_path.write_text(json.dumps(contract), encoding="utf-8")
+            (repo.path / "app.py").write_text("changed\n", encoding="utf-8")
+            before = (store.run_dir(run_id) / "state.json").read_bytes()
+
+            measured = service.measure_diff(
+                {"workspace": str(repo.path), "run_id": run_id}
+            )
+
+            self.assertEqual("legacy_report_only", measured["budget_status"])
+            self.assertEqual(1, measured["diff_stats"]["production"]["total"])
+            self.assertEqual(
+                before,
+                (store.run_dir(run_id) / "state.json").read_bytes(),
+            )
+
     def test_contract_is_immutable_and_files_are_private(self) -> None:
         with _support.TempRepo() as repo:
             context = resolve_repo(repo.path)

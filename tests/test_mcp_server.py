@@ -24,6 +24,7 @@ EXPECTED_TOOLS = {
     "create_run",
     "get_run",
     "list_runs",
+    "measure_diff",
     "plan_checks",
     "record_check",
     "start_stage",
@@ -54,6 +55,27 @@ class McpContractTests(unittest.TestCase):
         storage = schema["properties"]["storage"]
         self.assertEqual(["local", "repository"], storage["enum"])
         self.assertEqual("local", storage["default"])
+
+    def test_review_budget_is_exposed_for_campaign_tasks_and_runs(self) -> None:
+        create_campaign = next(
+            tool for tool in TOOLS if tool["name"] == "create_campaign"
+        )
+        task = create_campaign["inputSchema"]["properties"]["tasks"]["items"]
+        create_run = next(tool for tool in TOOLS if tool["name"] == "create_run")
+        for schema in (
+            task["properties"]["review_budget"],
+            create_run["inputSchema"]["properties"]["review_budget"],
+        ):
+            self.assertEqual(
+                700,
+                schema["properties"]["max_production_lines"]["maximum"],
+            )
+            self.assertFalse(schema["additionalProperties"])
+
+    def test_measure_diff_is_read_only(self) -> None:
+        measure = next(tool for tool in TOOLS if tool["name"] == "measure_diff")
+        self.assertTrue(measure["annotations"]["readOnlyHint"])
+        self.assertTrue(measure["annotations"]["idempotentHint"])
 
     def test_mcp_allowlist_matches_public_tool_surface(self) -> None:
         configuration = json.loads(

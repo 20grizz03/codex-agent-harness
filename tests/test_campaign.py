@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import stat
 import tempfile
 import unittest
@@ -81,6 +82,126 @@ def complete_run(repo: _support.TempRepo | Path, run_id: str) -> None:
 
 
 class CampaignTests(unittest.TestCase):
+    def test_campaign_task_budget_is_frozen_and_inherited(self) -> None:
+        with _support.TempRepo() as repo:
+            definition = {
+                **task("T-1", kind="implementation"),
+                "review_budget": {
+                    "expected_production_lines": {"min": 300, "max": 500},
+                    "max_production_lines": 700,
+                },
+            }
+            service = HarnessService({})
+            campaign = service.create_campaign(
+                campaign_arguments(repo, tasks=[definition])
+            )
+            campaign_id = campaign["contract"]["campaign_id"]
+            frozen = campaign["contract"]["tasks"][0]["review_budget"]
+            self.assertEqual(300, frozen["expected_production_lines"]["min"])
+            self.assertIsNone(frozen["exception_reason"])
+            service.record_campaign_task(
+                {
+                    "workspace": str(repo.path),
+                    "campaign_id": campaign_id,
+                    "task_id": "T-1",
+                    "status": "in_progress",
+                }
+            )
+            reference = {
+                "workspace": str(repo.path),
+                "campaign_id": campaign_id,
+                "task_id": "T-1",
+            }
+            run = service.create_run(
+                {
+                    "workspace": str(repo.path),
+                    "goal": "Implement T-1",
+                    "done_when": ["T-1 works"],
+                    "campaign": reference,
+                }
+            )
+            self.assertEqual(frozen, run["contract"]["review_budget"])
+            self.assertEqual("advisory", run["contract"]["review_budget_mode"])
+
+            with self.assertRaisesRegex(InputError, "conflicts"):
+                service.create_run(
+                    {
+                        "workspace": str(repo.path),
+                        "goal": "Implement T-1 differently",
+                        "done_when": ["T-1 works"],
+                        "campaign": reference,
+                        "review_budget": {"max_production_lines": 500},
+                    }
+                )
+
+    def test_oversized_budget_exception_records_cohesion_reason(self) -> None:
+        review_budget = {
+            "expected_production_lines": {"min": 20_000, "max": 30_000},
+            "max_production_lines": 700,
+            "exception_reason": (
+                "The PHP runtime and dependency graph cannot build in an intermediate state"
+            ),
+        }
+        with _support.TempRepo() as repo:
+            arguments = campaign_arguments(
+                repo,
+                tasks=[
+                    {
+                        **task("T-1", kind="implementation"),
+                        "review_budget": review_budget,
+                    }
+                ],
+            )
+            created = HarnessService({}).create_campaign(arguments)
+            self.assertEqual(
+                review_budget["exception_reason"],
+                created["contract"]["tasks"][0]["review_budget"][
+                    "exception_reason"
+                ],
+            )
+
+    def test_legacy_campaign_task_creates_report_only_run(self) -> None:
+        with _support.TempRepo() as repo:
+            service = HarnessService({})
+            campaign = service.create_campaign(
+                campaign_arguments(
+                    repo,
+                    tasks=[task("T-1", kind="implementation")],
+                )
+            )
+            campaign_id = campaign["contract"]["campaign_id"]
+            store = CampaignStore.for_workspace(repo.path)
+            contract_path = store.campaign_dir(campaign_id) / "contract.json"
+            contract = json.loads(contract_path.read_text(encoding="utf-8"))
+            contract["tasks"][0].pop("review_budget")
+            contract_path.write_text(json.dumps(contract), encoding="utf-8")
+            service.record_campaign_task(
+                {
+                    "workspace": str(repo.path),
+                    "campaign_id": campaign_id,
+                    "task_id": "T-1",
+                    "status": "in_progress",
+                }
+            )
+
+            run = service.create_run(
+                {
+                    "workspace": str(repo.path),
+                    "goal": "Complete the legacy task",
+                    "done_when": ["Legacy task works"],
+                    "campaign": {
+                        "workspace": str(repo.path),
+                        "campaign_id": campaign_id,
+                        "task_id": "T-1",
+                    },
+                }
+            )
+
+            self.assertEqual(
+                "legacy_report_only",
+                run["contract"]["review_budget_mode"],
+            )
+
     def test_complex_single_task_routes_to_openspec_before_run(self) -> None:
         workflow = (
             _support.PLUGIN_ROOT / "skills/workflow/references/protocol.md"
@@ -96,6 +217,22 @@ class CampaignTests(unittest.TestCase):
         self.assertIn("Google, Facebook, and Yandex", workflow)
         self.assertIn("one-task campaign", workflow)
         self.assertIn("одну сложную задачу", epic)
+
+    def test_reviewable_slice_guidance_uses_functionality_before_size(self) -> None:
+        live_epic = (
+            _support.PLUGIN_ROOT
+            / "skills/epic-workflow/references/live-epic.md"
+        ).read_text(encoding="utf-8")
+        direct = (
+            _support.PLUGIN_ROOT / "skills/workflow/references/protocol.md"
+        ).read_text(encoding="utf-8")
+
+        for guidance in (live_epic, direct):
+            self.assertIn("300–700", guidance)
+            self.assertIn("700", guidance)
+        self.assertIn("одну функциональность", live_epic)
+        self.assertIn("версии PHP", live_epic)
+        self.assertIn("не блокирует проверки или ревью", live_epic)
 
     def test_bundled_openspec_schema_has_declared_templates(self) -> None:
         root = (
@@ -1058,7 +1195,7 @@ class CampaignTests(unittest.TestCase):
                 "T-2": {"two.txt": "two\n"},
                 "integrate": {"one.txt": "one\n", "two.txt": "two\n"},
             }
-            for task_id in ("T-1", "T-2", "integrate"):
+            for task_id in ("T-1", "T-2"):
                 workspace = workspaces[task_id]
                 run = service.create_run(
                     {
@@ -1079,6 +1216,44 @@ class CampaignTests(unittest.TestCase):
                         "run_id": run["contract"]["run_id"],
                     }
                 )
+            service.record_campaign_task(
+                {**common, "task_id": "integrate", "status": "in_progress"}
+            )
+            integration_workspace = workspaces["integrate"]
+            integration_run = service.create_run(
+                {
+                    "workspace": str(integration_workspace),
+                    "goal": "Complete integrate",
+                    "done_when": ["integrate works"],
+                    "campaign": {
+                        **common,
+                        "task_id": "integrate",
+                    },
+                }
+            )
+            for name, content in changes["integrate"].items():
+                (integration_workspace / name).write_text(content, encoding="utf-8")
+            (integration_workspace / "app.py").write_text(
+                "line\n" * 601,
+                encoding="utf-8",
+            )
+            measured = service.measure_diff(
+                {
+                    "workspace": str(integration_workspace),
+                    "run_id": integration_run["contract"]["run_id"],
+                }
+            )
+            self.assertEqual("report_only", measured["budget_status"])
+            complete_run(integration_workspace, integration_run["contract"]["run_id"])
+            service.record_campaign_task(
+                {
+                    **common,
+                    "task_id": "integrate",
+                    "status": "complete",
+                    "run_workspace": str(integration_workspace),
+                    "run_id": integration_run["contract"]["run_id"],
+                }
+            )
             sealed = service.seal_campaign_candidate(
                 {**common, "summary": "candidate"}
             )

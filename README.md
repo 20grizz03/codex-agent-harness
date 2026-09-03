@@ -6,6 +6,8 @@ The plugin includes delivery-writing conventions: compact Jira tasks, post-imple
 
 Version 2.1 can read Jira epics and GitHub Enterprise delivery state through connectors already available to Codex. It can assign up to three dependency-free tasks to separate Codex subagents. Sequential tasks use clean chained commits, while a dedicated integration task rechecks and reviews the combined repository result. Every task keeps its own review. As soon as an independent PR or Jira result is locally complete, it moves to a fresh user-visible publication task while the epic continues; that task stays with the delivery through CI, review feedback, and deployment diagnosis. Publication waits for the shown package and `публикуем`. Claude remains the default critic; a confirmed Anthropic usage limit opens a campaign cooldown with one later recovery probe and explicit `codex_fallback` reviews meanwhile. Other Claude failures do not trigger retries or fallback.
 
+Implementation tasks are decomposed by observable functionality and normally map one-to-one to independently publishable pull requests. A typical slice targets 300–700 changed production-code lines, while tests, documentation, configuration, generated files, and binaries are reported separately. The limit is advisory: an indivisible change remains one task when splitting would make an intermediate state unbuildable, untestable, unsafe to deploy, or impossible to roll back.
+
 ## Skills
 
 - `workflow` runs repository mutations through the durable Codex-led cycle.

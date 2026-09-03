@@ -267,6 +267,9 @@ Git diff, surrounding production paths, tests, and relevant history yourself.
 Do not edit files. Report only actionable correctness, security, reliability,
 or contract defects with concrete impact and evidence. Do not repeat a known
 failed check as a new finding. Put uncertain validation gaps in residual_risks.
+The review budget is advisory: size alone is not a defect and must not become a
+finding. Review the functional contract and note mixed independent behavior only
+when it creates a concrete correctness, testing, rollout, or rollback risk.
 """.strip()
 )
 
@@ -317,6 +320,8 @@ def build_stage_prompt(
                 "forbidden_actions",
                 "writer",
                 "risk",
+                "review_budget",
+                "review_budget_mode",
                 "campaign",
                 "runtime_version",
             )
@@ -325,6 +330,8 @@ def build_stage_prompt(
             "diff_fingerprint": state.get("diff_fingerprint"),
             "changed_paths": state.get("changed_paths", []),
             "risk": state.get("risk"),
+            "diff_stats": state.get("diff_stats"),
+            "budget_status": state.get("budget_status"),
             "checks": [
                 {
                     "name": name,

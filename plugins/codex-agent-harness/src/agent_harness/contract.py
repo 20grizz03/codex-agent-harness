@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from .budget import normalize_review_budget, validate_review_budget_mode
 from .git_repo import RepoContext, resolve_base_sha, status_snapshot
 from .policy import validate_checks, validate_risk
 from .store import SCHEMA_VERSION
@@ -64,6 +65,10 @@ def build_contract(
     now = utc_now()
     run_id = new_run_id()
     risk = validate_risk(arguments.get("risk", "medium"))
+    review_budget = normalize_review_budget(arguments.get("review_budget"))
+    review_budget_mode = validate_review_budget_mode(
+        arguments.get("_review_budget_mode")
+    )
     base_sha = resolve_base_sha(context, arguments.get("base_sha"))
     frozen_checks = validate_checks(
         arguments.get("required_checks", []), source="contract"
@@ -100,6 +105,8 @@ def build_contract(
         "writer": writer,
         "writer_explicit": writer_explicit,
         "risk": risk,
+        "review_budget": review_budget,
+        "review_budget_mode": review_budget_mode,
         "required_checks": frozen_checks,
         "max_correction_passes": raw_corrections,
     }
@@ -118,6 +125,8 @@ def build_contract(
         "risk": risk,
         "diff_fingerprint": None,
         "changed_paths": [],
+        "diff_stats": None,
+        "budget_status": None,
         "planned_checks": [],
         "matched_policy_rules": [],
         "check_results": {},

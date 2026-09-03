@@ -35,6 +35,7 @@
         "create_run",
         "get_run",
         "list_runs",
+        "measure_diff",
         "plan_checks",
         "record_check",
         "start_stage",

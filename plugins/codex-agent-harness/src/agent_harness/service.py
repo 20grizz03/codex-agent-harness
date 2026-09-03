@@ -10,6 +10,11 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from . import claude_runtime
+from .budget import (
+    effective_review_budget,
+    normalize_review_budget,
+    review_budget_status,
+)
 from .campaign import (
     CAMPAIGN_TERMINAL_PHASES,
     COMPARISON_DIMENSIONS,
@@ -20,7 +25,7 @@ from .campaign import (
 )
 from .claude_runtime import ManagedStage
 from .contract import build_contract
-from .git_repo import diff_fingerprint, resolve_repo, status_snapshot
+from .git_repo import diff_fingerprint, diff_stats, resolve_repo, status_snapshot
 from .policy import RISK_RANK, plan_checks as build_check_plan, validate_risk
 from .review import build_stage_prompt, validate_review
 from .store import RunStore, SCHEMA_VERSION
@@ -294,6 +299,29 @@ class HarnessService:
         requested_risk = validate_risk(arguments.get("risk", "medium"))
         if RISK_RANK[requested_risk] < RISK_RANK[campaign_risk]:
             arguments["risk"] = campaign_risk
+        task_budget = definition.get("review_budget")
+        supplied_budget = arguments.get("review_budget")
+        if isinstance(task_budget, Mapping):
+            normalized_task_budget = normalize_review_budget(task_budget)
+            if supplied_budget is not None and normalize_review_budget(
+                supplied_budget
+            ) != normalized_task_budget:
+                raise InputError(
+                    "run review_budget conflicts with the campaign task"
+                )
+            arguments["review_budget"] = normalized_task_budget
+            arguments["_review_budget_mode"] = (
+                "report_only"
+                if definition.get("role") in {"integration", "finalizer"}
+                else "advisory"
+            )
+        else:
+            if supplied_budget is not None:
+                raise InputError(
+                    "a legacy campaign task cannot acquire an advisory review_budget"
+                )
+            arguments["review_budget"] = normalize_review_budget(None)
+            arguments["_review_budget_mode"] = "legacy_report_only"
         return {
             "reference": {
                 "workspace": str(store.context.repo_root),
@@ -436,6 +464,37 @@ class HarnessService:
                     }
                 )
         return {"runs": runs}
+
+    @staticmethod
+    def _measure_current_diff(
+        store: RunStore,
+        contract: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        fingerprint, paths = diff_fingerprint(
+            store.context,
+            base_sha=str(contract["base_sha"]),
+        )
+        statistics = diff_stats(
+            store.context,
+            base_sha=str(contract["base_sha"]),
+        )
+        return {
+            "diff_fingerprint": fingerprint,
+            "changed_paths": paths,
+            "diff_stats": statistics,
+            "review_budget": effective_review_budget(contract),
+            "budget_status": review_budget_status(contract, statistics),
+        }
+
+    def measure_diff(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        """Measure the current diff without changing persisted run state."""
+
+        store = RunStore.for_workspace(self._workspace(arguments))
+        run_id = self._run_id(arguments)
+        with self._lock:
+            contract = store.read_contract(run_id)
+            measurement = self._measure_current_diff(store, contract)
+        return {"run_id": run_id, **measurement}
 
     @staticmethod
     def _public_campaign(
@@ -639,6 +698,8 @@ class HarnessService:
             "risk": run_risk,
             "runtime_version": run_contract.get("runtime_version", "unknown"),
             "changed_paths": list(run_state.get("changed_paths", [])),
+            "diff_stats": run_state.get("diff_stats"),
+            "budget_status": run_state.get("budget_status"),
         }
 
     @staticmethod
@@ -1369,15 +1430,20 @@ class HarnessService:
                 store, run_id, store.read_state(run_id)
             )
             self._require_open(state)
-            fingerprint, paths = diff_fingerprint(
-                store.context, base_sha=str(contract["base_sha"])
-            )
+            measurement = self._measure_current_diff(store, contract)
+            fingerprint = str(measurement["diff_fingerprint"])
+            paths = list(measurement["changed_paths"])
+            statistics = dict(measurement["diff_stats"])
+            budget_status = str(measurement["budget_status"])
             previous = state.get("diff_fingerprint")
-            if previous == fingerprint and state.get("planned_checks"):
+            if previous == fingerprint and isinstance(state.get("diff_stats"), dict):
                 return {
                     "run_id": run_id,
                     "diff_fingerprint": fingerprint,
                     "changed_paths": state.get("changed_paths", []),
+                    "diff_stats": state.get("diff_stats"),
+                    "review_budget": effective_review_budget(contract),
+                    "budget_status": state.get("budget_status"),
                     "risk": state.get("risk"),
                     "checks": state.get("planned_checks", []),
                     "deduplicated": True,
@@ -1420,6 +1486,8 @@ class HarnessService:
             )
             state["diff_fingerprint"] = fingerprint
             state["changed_paths"] = paths
+            state["diff_stats"] = statistics
+            state["budget_status"] = budget_status
             state["planned_checks"] = checks
             state["matched_policy_rules"] = matched
             state["risk"] = risk
@@ -1435,12 +1503,17 @@ class HarnessService:
                     "check_names": [check["name"] for check in checks],
                     "risk": risk,
                     "matched_policy_rules": matched,
+                    "budget_status": budget_status,
+                    "production_lines": statistics["production"]["total"],
                 },
             )
         return {
             "run_id": run_id,
             "diff_fingerprint": fingerprint,
             "changed_paths": paths,
+            "diff_stats": statistics,
+            "review_budget": effective_review_budget(contract),
+            "budget_status": budget_status,
             "risk": risk,
             "checks": checks,
             "deduplicated": False,
@@ -2234,6 +2307,10 @@ class HarnessService:
         )
         if current != state.get("diff_fingerprint"):
             blockers.append("current diff does not match the checked fingerprint")
+        if "review_budget" in contract:
+            budget_status = state.get("budget_status")
+            if budget_status is None:
+                blockers.append("review budget has not been measured")
         checks_ok, outstanding = self._check_gate(state)
         if not checks_ok:
             blockers.append("required checks are not green: " + ", ".join(outstanding))

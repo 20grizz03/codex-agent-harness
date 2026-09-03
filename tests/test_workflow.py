@@ -163,6 +163,167 @@ class CodexWriterWorkflowTests(unittest.TestCase):
             _support.fake_environment(fake, result or _support.PASS_REVIEW, **updates)
         )
 
+    def test_measure_diff_is_read_only_and_separates_tests(self) -> None:
+        with _support.TempRepo() as repo:
+            service = HarnessService({})
+            run_id = service.create_run(
+                {
+                    "workspace": str(repo.path),
+                    "goal": "Add a focused feature",
+                    "done_when": ["The feature works"],
+                    "review_budget": {
+                        "expected_production_lines": {"min": 300, "max": 500}
+                    },
+                }
+            )["contract"]["run_id"]
+            source = repo.path / "src" / "app.py"
+            tests = repo.path / "tests" / "test_app.py"
+            source.parent.mkdir()
+            tests.parent.mkdir()
+            source.write_text("line\n" * 450, encoding="utf-8")
+            tests.write_text("test\n" * 900, encoding="utf-8")
+
+            first = service.measure_diff(
+                {"workspace": str(repo.path), "run_id": run_id}
+            )
+            second = service.measure_diff(
+                {"workspace": str(repo.path), "run_id": run_id}
+            )
+
+            self.assertEqual("within_budget", first["budget_status"])
+            self.assertEqual(450, first["diff_stats"]["production"]["total"])
+            self.assertEqual(900, first["diff_stats"]["tests"]["total"])
+            self.assertEqual(first["diff_fingerprint"], second["diff_fingerprint"])
+            self.assertEqual(
+                "writing",
+                service.get_run(
+                    {"workspace": str(repo.path), "run_id": run_id}
+                )["state"]["phase"],
+            )
+            source.write_text("line\n" * 451, encoding="utf-8")
+            changed = service.measure_diff(
+                {"workspace": str(repo.path), "run_id": run_id}
+            )
+            self.assertNotEqual(first["diff_fingerprint"], changed["diff_fingerprint"])
+            self.assertEqual(451, changed["diff_stats"]["production"]["total"])
+
+    def test_small_configuration_change_is_not_artificially_enlarged(self) -> None:
+        with _support.TempRepo() as repo:
+            service = HarnessService({})
+            run_id = service.create_run(
+                {
+                    "workspace": str(repo.path),
+                    "goal": "Adjust configuration",
+                    "done_when": ["Configuration contains the required entries"],
+                }
+            )["contract"]["run_id"]
+            (repo.path / "service.yaml").write_text(
+                "key: value\n" * 80,
+                encoding="utf-8",
+            )
+
+            measured = service.measure_diff(
+                {"workspace": str(repo.path), "run_id": run_id}
+            )
+
+            self.assertEqual("within_budget", measured["budget_status"])
+            self.assertEqual(80, measured["diff_stats"]["configuration"]["total"])
+            self.assertEqual(0, measured["diff_stats"]["production"]["total"])
+
+    def test_over_soft_limit_is_advisory_and_keeps_checks_available(self) -> None:
+        with _support.TempRepo() as repo, tempfile.TemporaryDirectory() as directory:
+            service = self._service(Path(directory))
+            run_id = service.create_run(
+                {
+                    "workspace": str(repo.path),
+                    "goal": "Add too much code",
+                    "done_when": ["The feature works"],
+                }
+            )["contract"]["run_id"]
+            (repo.path / "app.py").write_text("line\n" * 701, encoding="utf-8")
+
+            plan = service.plan_checks(
+                {"workspace": str(repo.path), "run_id": run_id}
+            )
+
+            self.assertEqual("over_soft_limit", plan["budget_status"])
+            self.assertEqual(
+                ["git-diff-check"], [check["name"] for check in plan["checks"]]
+            )
+            self.assertEqual(
+                "checking",
+                service.get_run(
+                    {"workspace": str(repo.path), "run_id": run_id}
+                )["state"]["phase"],
+            )
+            service.record_check(
+                {
+                    "workspace": str(repo.path),
+                    "run_id": run_id,
+                    "check_name": "git-diff-check",
+                    "exit_code": 0,
+                    "duration_ms": 1,
+                }
+            )
+            started = service.start_stage(
+                {
+                    "workspace": str(repo.path),
+                    "run_id": run_id,
+                    "profile": "critic",
+                }
+            )
+            self.assertEqual("critic", started["profile"])
+            wait_for_stage(service, repo.path, run_id, started["stage_id"])
+            _support.wait_until(
+                lambda: service.get_run(
+                    {"workspace": str(repo.path), "run_id": run_id}
+                )["review"]["review"]
+            )
+            service.record_review_resolution(
+                {
+                    "workspace": str(repo.path),
+                    "run_id": run_id,
+                    "resolutions": [],
+                }
+            )
+            finished = service.finish_run(
+                {
+                    "workspace": str(repo.path),
+                    "run_id": run_id,
+                    "status": "complete",
+                }
+            )
+            self.assertEqual("complete", finished["phase"])
+
+    def test_cohesive_exception_reports_approved_oversized_diff(self) -> None:
+        with _support.TempRepo() as repo:
+            service = HarnessService({})
+            run_id = service.create_run(
+                {
+                    "workspace": str(repo.path),
+                    "goal": "Upgrade the PHP runtime atomically",
+                    "done_when": ["The upgraded project builds as one unit"],
+                    "risk": "medium",
+                    "review_budget": {
+                        "expected_production_lines": {"min": 701, "max": 30_000},
+                        "max_production_lines": 700,
+                        "exception_reason": (
+                            "Intermediate runtime and dependency states do not build"
+                        ),
+                    },
+                }
+            )["contract"]["run_id"]
+            (repo.path / "app.php").write_text("line\n" * 701, encoding="utf-8")
+
+            plan = service.plan_checks(
+                {"workspace": str(repo.path), "run_id": run_id}
+            )
+
+            self.assertEqual("approved_exception", plan["budget_status"])
+            self.assertEqual(
+                ["git-diff-check"], [check["name"] for check in plan["checks"]]
+            )
+
     def test_clean_pass_flow_completes_and_is_idempotent(self) -> None:
         with _support.TempRepo() as repo, tempfile.TemporaryDirectory() as directory:
             service = self._service(Path(directory))

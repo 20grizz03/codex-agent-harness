@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from .budget import normalize_review_budget
 from .contract import DEFAULT_FORBIDDEN_ACTIONS
 from .git_repo import RepoContext, resolve_repo, run_git, status_snapshot
 from .policy import validate_risk
@@ -476,6 +477,7 @@ def _tasks(value: Any) -> list[dict[str, Any]]:
                 "base_sha",
                 "base_from_task",
                 "role",
+                "review_budget",
             },
         )
         task_id = require_string(task.get("id"), f"tasks[{index}].id", maximum=80)
@@ -533,6 +535,14 @@ def _tasks(value: Any) -> list[dict[str, Any]]:
                 f"tasks[{index}].role is only valid for implementation tasks"
             )
         normalized["role"] = role
+        if task.get("review_budget") is not None and kind != "implementation":
+            raise InputError(
+                f"tasks[{index}].review_budget is only valid for implementation tasks"
+            )
+        if kind == "implementation":
+            normalized["review_budget"] = normalize_review_budget(
+                task.get("review_budget")
+            )
         if task.get("workspace") is not None:
             normalized["workspace"] = require_string(
                 task.get("workspace"),

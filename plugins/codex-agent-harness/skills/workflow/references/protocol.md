@@ -27,13 +27,15 @@ One ready Jira issue is not automatically simple. For example, “run Google, Fa
 
 For a direct task, show one concise plan that names the observable result, affected area, important non-goals or boundaries, and checks. Include failure and recovery behavior whenever they are relevant. A list of filenames or implementation steps alone is not an adequate plan. When the result will be delivered through Jira or a pull request, also state that local completion will create a fresh user-visible Codex publication task; approval of the plan is the explicit authorization to create that task later.
 
+The direct task must contain one observable functionality and normally map to one independently publishable pull request. Aim for 300–700 changed production-code lines, with no lower bound for a naturally small change; report tests, documentation, configuration, generated files, and binaries separately. If the estimate is above 700, re-evaluate whether the work contains several useful behaviors and switch to `epic-workflow` with OpenSpec when it does. Keep an indivisible behavior together when splitting would break buildability, testability, safe rollout, or rollback; record that reason without escalating risk solely because of size.
+
 If the user already supplied a concrete plan and explicitly asked to implement it, that request is the approval; do not ask again. It authorizes a later publication task only when the supplied plan explicitly includes one. When OpenSpec is required, still materialize and show the equivalent artifacts before code, but wait again only if this exposes a new product decision or materially changes the approved contract.
 
 Approval authorizes reversible local edits, checks, corrections, and commits within that plan. Do not request separate permission to write code. Ask again only when the product contract or scope materially expands, the task overlaps user-owned dirty files, or an external or irreversible action is required.
 
 ## 3. Freeze the contract
 
-Before editing, call `create_run` with the goal, non-goals, observable `done_when` criteria, constraints, forbidden actions, risk, and checks discovered from repository guidance. Default to `writer: codex`, `risk: medium`, and one correction pass. For an epic task also pass its `campaign` reference; the server resolves its base, inherits campaign risk, and freezes the active plugin version.
+Before editing, call `create_run` with the goal, non-goals, observable `done_when` criteria, constraints, forbidden actions, risk, checks discovered from repository guidance, and a frozen `review_budget`. Default that budget to expected production lines `0..700`, a soft maximum of 700, and no exception reason; default to `writer: codex`, `risk: medium`, and one correction pass. For an epic task also pass its `campaign` reference; the server resolves its base, inherits the task budget and campaign risk, and freezes the active plugin version. A campaign-linked run cannot expand its budget.
 
 Use `writer: claude` only after an explicit current-task request and set `writer_explicit: true`. Never ask one provider to be both writer and independent critic.
 
@@ -43,7 +45,7 @@ The contract is immutable. If the goal or acceptance criteria materially change,
 
 Implement the requested outcome as Codex unless the contract names Claude. Preserve unrelated changes and do not commit unless the current task authorizes it.
 
-Call `plan_checks` after the diff exists. For a campaign task that is a later `base_from_task` predecessor, create its already-approved atomic local commit before the final check plan so the next task receives a clean base. If review correction is needed, amend that commit once and rerun all checks. Run every returned command exactly as an argv array, subject to the normal sandbox and egress audit. Record each result with `record_check`; include only a short sanitized summary, never raw logs or secrets.
+Call the read-only `measure_diff` after each coherent slice and before adding another behavior when production changes approach 500 lines. A result above the soft limit does not block writing, checks, review, or completion. Re-evaluate the functional boundary: reduce a mixed task, or keep a cohesive change and carry the concrete reason into the publication package. Call `plan_checks` after the diff exists; it persists the categorized counts for the current fingerprint. For a campaign task that is a later `base_from_task` predecessor, create its already-approved atomic local commit before the final check plan so the next task receives a clean base. If review correction is needed, amend that commit once and rerun all checks. Run every returned command exactly as an argv array, subject to the normal sandbox and egress audit. Record each result with `record_check`; include only a short sanitized summary, never raw logs or secrets.
 
 The egress audit restricts execution, not repository editing. Shared queues, databases, mail, APIs, or other endpoints never revoke an approved local implementation plan. Continue writing the code, then isolate the command with safe configuration. If that is impossible, leave it unrun and report the resulting completion blocker; an additional safe check does not erase a mandatory result.
 
@@ -70,6 +72,8 @@ At most one correction pass is allowed. First record an accepted finding with `r
 Call `finish_run` with `complete` only when the server confirms that current checks pass, an independent review exists, all findings are resolved, and no blocking question remains. Use `needs_human` for scope expansion, unresolved P0/P1 findings, dirty-file ownership, or a required user decision. Use `blocked`, `failed`, or `interrupted` only for their literal terminal conditions.
 
 ## 7. Hand off for publication
+
+Include the persisted `diff_stats` and `budget_status` in the compact handoff, so publication can show the categorized size and any cohesive overage without reusing the implementation conversation.
 
 The required boundary is a fresh user-visible task that does not inherit implementation history. In the current Codex app the user-facing lead creates it with `create_thread`; a campaign executor returns to the campaign lead. Do not use `fork_thread`, because a fork retains the history this boundary is intended to discard. If fresh-task creation is unavailable, show the compact handoff in the current task and ask the user to open a new one; do not fork the context or perform external writes.
 

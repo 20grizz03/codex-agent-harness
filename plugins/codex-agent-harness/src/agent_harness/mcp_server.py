@@ -19,6 +19,8 @@ SERVER_INSTRUCTIONS = (
     "Approved OpenSpec references are semantically fingerprinted and rechecked; "
     "local mode requires an ignored project /openspec and keeps a private snapshot. "
     "OpenSpec never replaces campaign execution state. "
+    "Each implementation run reports categorized diff size against an advisory "
+    "review budget; an overage never bypasses checks or blocks them by itself. "
     "A replay candidate must be sealed before historical evidence is compared. "
     "Prefer calling model-backed lifecycle tools start_stage, poll_stage, and "
     "cancel_stage from one native tracking subagent. If plugin tools are unavailable "
@@ -166,6 +168,30 @@ CAMPAIGN_RUN_SCHEMA = {
     },
     "additionalProperties": False,
 }
+REVIEW_BUDGET_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "expected_production_lines": {
+            "type": "object",
+            "properties": {
+                "min": {"type": "integer", "minimum": 0, "maximum": 10000000},
+                "max": {"type": "integer", "minimum": 0, "maximum": 10000000},
+            },
+            "additionalProperties": False,
+        },
+        "max_production_lines": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 700,
+        },
+        "exception_reason": {
+            "type": ["string", "null"],
+            "minLength": 1,
+            "maxLength": 2000,
+        },
+    },
+    "additionalProperties": False,
+}
 CAMPAIGN_TASK_SCHEMA = {
     "type": "object",
     "required": ["id", "title", "goal", "done_when"],
@@ -199,6 +225,7 @@ CAMPAIGN_TASK_SCHEMA = {
             "type": "string",
             "enum": ["task", "integration", "finalizer"],
         },
+        "review_budget": REVIEW_BUDGET_SCHEMA,
     },
     "additionalProperties": False,
 }
@@ -541,7 +568,8 @@ TOOLS: list[dict[str, Any]] = [
         "name": "create_run",
         "description": (
             "Create one immutable task contract in target Git metadata before "
-            "repository edits. An optional campaign link resolves base and minimum risk. "
+            "repository edits. An optional campaign link resolves base, review budget, "
+            "and minimum risk. "
             "Rejects dirty worktrees unless explicitly acknowledged."
         ),
         "inputSchema": {
@@ -591,6 +619,7 @@ TOOLS: list[dict[str, Any]] = [
                     "maxLength": 64,
                 },
                 "campaign": CAMPAIGN_RUN_SCHEMA,
+                "review_budget": REVIEW_BUDGET_SCHEMA,
             },
             "additionalProperties": False,
         },
@@ -628,6 +657,22 @@ TOOLS: list[dict[str, Any]] = [
         },
         "annotations": _annotations(
             "List durable task runs", read_only=True, idempotent=True
+        ),
+    },
+    {
+        "name": "measure_diff",
+        "description": (
+            "Measure the current run diff and classify line counts against its "
+            "immutable advisory review budget without changing lifecycle state."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["workspace", "run_id"],
+            "properties": {"workspace": WORKSPACE, "run_id": RUN_ID},
+            "additionalProperties": False,
+        },
+        "annotations": _annotations(
+            "Measure current diff", read_only=True, idempotent=True
         ),
     },
     {
@@ -837,6 +882,7 @@ class McpServer:
             "create_run": self.service.create_run,
             "get_run": self.service.get_run,
             "list_runs": self.service.list_runs,
+            "measure_diff": self.service.measure_diff,
             "plan_checks": self.service.plan_checks,
             "record_check": self.service.record_check,
             "start_stage": self.service.start_stage,
