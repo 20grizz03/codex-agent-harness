@@ -21,7 +21,7 @@ from .review import (
     REVIEW_JSON_SCHEMA,
     normalize_usage,
     validate_implementation_result,
-    validate_review,
+    validate_review_with_normalization,
 )
 from .util import InputError, numeric_tree, sanitize_text, utc_now
 
@@ -630,9 +630,12 @@ class ManagedStage:
         models = _actual_models(payload)
         quality = _quality_floor(models)
         structured = payload.get("structured_output")
+        review_normalization = None
         try:
             if self.profile == "critic":
-                result = validate_review(structured, origin="claude")
+                result, review_normalization = validate_review_with_normalization(
+                    structured, origin="claude"
+                )
             else:
                 result = validate_implementation_result(structured)
         except InputError as exc:
@@ -657,6 +660,8 @@ class ManagedStage:
                 else None,
             }
         )
+        if review_normalization is not None:
+            telemetry["review_normalization"] = review_normalization
         if quality == "violated":
             return {
                 "lifecycle_state": "failed",

@@ -190,6 +190,7 @@ class CodexWriterWorkflowTests(unittest.TestCase):
                 service, repo.path, run_id, started["stage_id"]
             )
             self.assertEqual("completed", terminal["lifecycle_state"])
+            self.assertNotIn("review_normalization", terminal["telemetry"])
             _support.wait_until(
                 lambda: service.get_run(
                     {"workspace": str(repo.path), "run_id": run_id}
@@ -222,6 +223,147 @@ class CodexWriterWorkflowTests(unittest.TestCase):
                 }
             )
             self.assertTrue(repeated["deduplicated"])
+
+    def test_pass_with_findings_enters_reviewing_without_retry(self) -> None:
+        review = _support.finding_review()
+        review["verdict"] = "pass"
+        with _support.TempRepo() as repo, tempfile.TemporaryDirectory() as directory:
+            service = self._service(Path(directory), review)
+            run_id = service.create_run(
+                {
+                    "workspace": str(repo.path),
+                    "goal": "Update docs",
+                    "done_when": ["Docs are current"],
+                }
+            )["contract"]["run_id"]
+            (repo.path / "README.md").write_text("changed\n", encoding="utf-8")
+            run_planned_checks(service, repo.path, run_id)
+            stage = service.start_stage(
+                {
+                    "workspace": str(repo.path),
+                    "run_id": run_id,
+                    "profile": "critic",
+                }
+            )
+            wait_for_stage(service, repo.path, run_id, stage["stage_id"])
+            persisted = _support.wait_until(
+                lambda: service.get_run(
+                    {"workspace": str(repo.path), "run_id": run_id}
+                )
+                if service.get_run(
+                    {"workspace": str(repo.path), "run_id": run_id}
+                )["review"]["review"]
+                else None
+            )
+
+            self.assertEqual("reviewing", persisted["state"]["phase"])
+            self.assertEqual(
+                "changes_requested", persisted["review"]["review"]["verdict"]
+            )
+            self.assertEqual(
+                review["findings"], persisted["review"]["review"]["findings"]
+            )
+            self.assertEqual(1, len(persisted["state"]["stages"]))
+            telemetry = persisted["state"]["stages"][stage["stage_id"]]["telemetry"]
+            self.assertEqual(
+                {
+                    "original_verdict": "pass",
+                    "final_verdict": "changes_requested",
+                    "reason": "findings_present",
+                },
+                telemetry["review_normalization"],
+            )
+
+    def test_blocking_question_overrides_findings_end_to_end(self) -> None:
+        review = _support.finding_review()
+        review["verdict"] = "pass"
+        review["blocking_question"] = "Which contract is authoritative?"
+        with _support.TempRepo() as repo, tempfile.TemporaryDirectory() as directory:
+            service = self._service(Path(directory), review)
+            run_id = service.create_run(
+                {
+                    "workspace": str(repo.path),
+                    "goal": "Update docs",
+                    "done_when": ["Docs are current"],
+                }
+            )["contract"]["run_id"]
+            (repo.path / "README.md").write_text("changed\n", encoding="utf-8")
+            run_planned_checks(service, repo.path, run_id)
+            stage = service.start_stage(
+                {
+                    "workspace": str(repo.path),
+                    "run_id": run_id,
+                    "profile": "critic",
+                }
+            )
+            terminal = wait_for_stage(service, repo.path, run_id, stage["stage_id"])
+            persisted = _support.wait_until(
+                lambda: service.get_run(
+                    {"workspace": str(repo.path), "run_id": run_id}
+                )
+                if service.get_run(
+                    {"workspace": str(repo.path), "run_id": run_id}
+                )["review"]["review"]
+                else None
+            )
+
+            self.assertEqual("blocked", terminal["result"]["verdict"])
+            self.assertEqual("blocked", persisted["review"]["review"]["verdict"])
+            self.assertEqual(
+                review["findings"], persisted["review"]["review"]["findings"]
+            )
+            self.assertEqual(
+                "blocking_question_present",
+                persisted["state"]["stages"][stage["stage_id"]]["telemetry"]
+                ["review_normalization"]["reason"],
+            )
+
+    def test_malformed_review_fails_without_retry_or_fallback(self) -> None:
+        review = _support.finding_review()
+        review["verdict"] = "pass"
+        review["findings"][0]["severity"] = "P4"
+        with _support.TempRepo() as repo, tempfile.TemporaryDirectory() as directory:
+            service = self._service(Path(directory), review)
+            run_id = service.create_run(
+                {
+                    "workspace": str(repo.path),
+                    "goal": "Update docs",
+                    "done_when": ["Docs are current"],
+                }
+            )["contract"]["run_id"]
+            (repo.path / "README.md").write_text("changed\n", encoding="utf-8")
+            run_planned_checks(service, repo.path, run_id)
+            stage = service.start_stage(
+                {
+                    "workspace": str(repo.path),
+                    "run_id": run_id,
+                    "profile": "critic",
+                }
+            )
+            terminal = wait_for_stage(service, repo.path, run_id, stage["stage_id"])
+            persisted = _support.wait_until(
+                lambda: service.get_run(
+                    {"workspace": str(repo.path), "run_id": run_id}
+                )
+                if service.get_run(
+                    {"workspace": str(repo.path), "run_id": run_id}
+                )["state"]["phase"]
+                == "failed"
+                else None
+            )
+
+            self.assertEqual("failed", terminal["lifecycle_state"])
+            self.assertNotIn("failure_kind", terminal)
+            self.assertEqual(1, len(persisted["state"]["stages"]))
+            with self.assertRaises(StateError):
+                service.record_review_resolution(
+                    {
+                        "workspace": str(repo.path),
+                        "run_id": run_id,
+                        "review": _support.PASS_REVIEW,
+                        "resolutions": [],
+                    }
+                )
 
     def test_confirmed_anthropic_limit_allows_one_codex_fallback_review(self) -> None:
         with _support.TempRepo() as repo, tempfile.TemporaryDirectory() as directory:

@@ -177,6 +177,117 @@ class ManagedStageTests(unittest.TestCase):
             self.assertNotIn("x" * 100, rendered)
             self.assertIn("assistant_progress", rendered)
             self.assertEqual("pass", terminal["result"]["verdict"])
+            self.assertNotIn("review_normalization", terminal["telemetry"])
+
+    def test_contradictory_review_is_normalized_with_allowlisted_telemetry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = _support.finding_review()
+            source["verdict"] = "pass"
+            fake = _support.make_fake_claude(root)
+            environ = _support.fake_environment(fake, source)
+            stage = ManagedStage(
+                stage_id="run-test:critic:1",
+                run_id="run-test",
+                profile="critic",
+                command=build_command(
+                    str(fake), profile="critic", model="claude-opus-5"
+                ),
+                cwd=root,
+                prompt="review the repository",
+                environ=environ,
+                requested_model="claude-opus-5",
+                timeout_seconds=30,
+                heartbeat_seconds=1,
+                stall_seconds=5,
+                on_event=lambda _event: None,
+                on_terminal=lambda _terminal: None,
+            )
+
+            terminal = _support.wait_until(lambda: stage.poll().get("terminal"))
+
+            self.assertEqual("completed", terminal["lifecycle_state"])
+            self.assertEqual("changes_requested", terminal["result"]["verdict"])
+            self.assertEqual(source["findings"], terminal["result"]["findings"])
+            self.assertEqual(
+                {
+                    "original_verdict": "pass",
+                    "final_verdict": "changes_requested",
+                    "reason": "findings_present",
+                },
+                terminal["telemetry"]["review_normalization"],
+            )
+            self.assertIn("duration_ms", terminal["telemetry"])
+            self.assertIn("quality_floor_status", terminal["telemetry"])
+
+    def test_blocking_question_normalization_has_priority(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = _support.finding_review()
+            source["verdict"] = "pass"
+            source["blocking_question"] = "Which contract is authoritative?"
+            fake = _support.make_fake_claude(root)
+            environ = _support.fake_environment(fake, source)
+            stage = ManagedStage(
+                stage_id="run-test:critic:1",
+                run_id="run-test",
+                profile="critic",
+                command=build_command(
+                    str(fake), profile="critic", model="claude-opus-5"
+                ),
+                cwd=root,
+                prompt="review the repository",
+                environ=environ,
+                requested_model="claude-opus-5",
+                timeout_seconds=30,
+                heartbeat_seconds=1,
+                stall_seconds=5,
+                on_event=lambda _event: None,
+                on_terminal=lambda _terminal: None,
+            )
+
+            terminal = _support.wait_until(lambda: stage.poll().get("terminal"))
+
+            self.assertEqual("completed", terminal["lifecycle_state"])
+            self.assertEqual("blocked", terminal["result"]["verdict"])
+            self.assertEqual(source["findings"], terminal["result"]["findings"])
+            self.assertEqual(
+                "blocking_question_present",
+                terminal["telemetry"]["review_normalization"]["reason"],
+            )
+
+    def test_malformed_review_remains_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = _support.finding_review()
+            source["verdict"] = "pass"
+            source["findings"][0]["severity"] = "P4"
+            fake = _support.make_fake_claude(root)
+            environ = _support.fake_environment(fake, source)
+            stage = ManagedStage(
+                stage_id="run-test:critic:1",
+                run_id="run-test",
+                profile="critic",
+                command=build_command(
+                    str(fake), profile="critic", model="claude-opus-5"
+                ),
+                cwd=root,
+                prompt="review the repository",
+                environ=environ,
+                requested_model="claude-opus-5",
+                timeout_seconds=30,
+                heartbeat_seconds=1,
+                stall_seconds=5,
+                on_event=lambda _event: None,
+                on_terminal=lambda _terminal: None,
+            )
+
+            terminal = _support.wait_until(lambda: stage.poll().get("terminal"))
+
+            self.assertEqual("failed", terminal["lifecycle_state"])
+            self.assertIn("finding.severity", terminal["error"])
+            self.assertNotIn("failure_kind", terminal)
+            self.assertNotIn("review_normalization", terminal["telemetry"])
 
     def test_stderr_and_invalid_json_are_counted_not_returned(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

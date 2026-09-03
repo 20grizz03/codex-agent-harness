@@ -19,6 +19,8 @@ from .util import (
 
 SEVERITIES = ("P0", "P1", "P2", "P3")
 VERDICTS = ("pass", "changes_requested", "blocked")
+FINDINGS_NORMALIZATION_REASON = "findings_present"
+BLOCKING_QUESTION_NORMALIZATION_REASON = "blocking_question_present"
 
 REVIEW_JSON_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -107,7 +109,9 @@ IMPLEMENT_JSON_SCHEMA: dict[str, Any] = {
 }
 
 
-def validate_review(value: Any, *, origin: str) -> dict[str, Any]:
+def validate_review_with_normalization(
+    value: Any, *, origin: str
+) -> tuple[dict[str, Any], dict[str, str] | None]:
     if not isinstance(value, dict):
         raise InputError("review must be a JSON object")
     verdict = value.get("verdict")
@@ -166,19 +170,53 @@ def validate_review(value: Any, *, origin: str) -> dict[str, Any]:
             require_string(question, "review.blocking_question", maximum=2_000),
             maximum=2_000,
         )
-    if verdict == "pass" and findings:
-        raise InputError("a pass review must not contain findings")
-    if verdict == "changes_requested" and not findings:
+    final_verdict = verdict
+    reason: str | None = None
+    if question:
+        final_verdict = "blocked"
+        reason = BLOCKING_QUESTION_NORMALIZATION_REASON
+    elif findings:
+        final_verdict = "changes_requested"
+        reason = FINDINGS_NORMALIZATION_REASON
+    elif verdict == "changes_requested":
         raise InputError("a changes_requested review must contain a finding")
-    if verdict == "blocked" and not question:
+    elif verdict == "blocked":
         raise InputError("a blocked review requires one blocking_question")
-    return {
+
+    normalization = None
+    if final_verdict != verdict:
+        assert reason is not None
+        normalization = {
+            "original_verdict": verdict,
+            "final_verdict": final_verdict,
+            "reason": reason,
+        }
+    review = {
         "origin": origin,
-        "verdict": verdict,
+        "verdict": final_verdict,
         "findings": findings,
         "residual_risks": risks,
         "blocking_question": question,
     }
+    return review, normalization
+
+
+def validate_review(value: Any, *, origin: str) -> dict[str, Any]:
+    review, normalization = validate_review_with_normalization(
+        value, origin=origin
+    )
+    if normalization is None:
+        return review
+
+    original_verdict = normalization["original_verdict"]
+    if original_verdict == "pass" and review["findings"]:
+        raise InputError("a pass review must not contain findings")
+    if original_verdict == "changes_requested" and not review["findings"]:
+        raise InputError("a changes_requested review must contain a finding")
+    if original_verdict == "blocked" and not review["blocking_question"]:
+        raise InputError("a blocked review requires one blocking_question")
+    review["verdict"] = original_verdict
+    return review
 
 
 def validate_implementation_result(value: Any) -> dict[str, Any]:
