@@ -71,7 +71,8 @@ def openspec_files() -> dict[str, str]:
             "## Failure and Recovery\n\nRetry is not needed.\n\n"
             "## Operability\n\nNo runtime wiring.\n\n"
             "## Compatibility\n\nBackward compatible.\n\n"
-            "## UI and Source Material\n\nNo UI.\n"
+            "## UI and Source Material\n\nNo UI.\n\n"
+            "## Decomposition Readiness\n\nСтатус: ready\n"
         ),
         "specs/feature/spec.md": (
             "## ADDED Requirements\n\n"
@@ -79,7 +80,11 @@ def openspec_files() -> dict[str, str]:
             "#### Scenario: Success\n\n"
             "- **WHEN** requested\n- **THEN** it works\n"
         ),
-        "tasks.md": "## 1. Work\n\n- [ ] 1.1 Implement and verify\n",
+        "tasks.md": (
+            "## Проверка готовности декомпозиции\n\n"
+            "- Статус: ready\n\n"
+            "## 1. Work\n\n- [ ] 1.1 Implement and verify\n"
+        ),
     }
 
 

@@ -49,7 +49,7 @@ Initialize a target repository only when its owners explicitly want versioned sp
 env OPENSPEC_TELEMETRY=0 openspec init
 ```
 
-The setup audit never runs installation, schema copy, or `openspec init`. Agent Harness disables OpenSpec telemetry in every command it invokes. The custom schema requires concise Russian content, explicit unresolved questions, behavior and failure contracts, security/data, recovery, operability, compatibility, UI/source material, one independently verifiable functionality per Agent Harness task, an advisory 300–700 production-line target reported separately from tests, documentation, configuration, generated files, and binaries, a capability preflight, and a combined integration run.
+The setup audit never runs installation, schema copy, or `openspec init`. Repeat the copy command after a plugin update so existing user-level schema files receive new templates and instructions. Agent Harness disables OpenSpec telemetry in every command it invokes. The custom schema requires technical decomposition readiness before implementation tasks, concise Russian content, explicit unresolved questions, behavior and failure contracts, security/data, recovery, operability, compatibility, UI/source material, one independently verifiable functionality per Agent Harness task, an advisory 300–700 production-line target reported separately from tests, documentation, configuration, generated files, and binaries, a capability preflight, and a combined integration run.
 
 ## Scenario integrations
 

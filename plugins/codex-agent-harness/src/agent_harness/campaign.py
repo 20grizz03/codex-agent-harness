@@ -54,6 +54,13 @@ OPENSPEC_DESIGN_HEADINGS = (
     "Compatibility",
     "UI and Source Material",
 )
+OPENSPEC_READINESS_SECTIONS = (
+    ("design.md", "Decomposition Readiness"),
+    ("tasks.md", "Проверка готовности декомпозиции"),
+)
+OPENSPEC_READINESS_STATUS_RE = re.compile(
+    r"(?m)^[ \t]*(?:-[ \t]+)?Статус:[ \t]*(ready|analysis_required)[ \t]*$"
+)
 
 MAX_OPENSPEC_FILES = 512
 MAX_OPENSPEC_BYTES = 8 * 1024 * 1024
@@ -315,6 +322,38 @@ def _openspec_fingerprint_files(relative_files: Mapping[str, bytes]) -> str:
         digest.update(content)
         digest.update(b"\0")
     return digest.hexdigest()
+
+
+def _openspec_decomposition_readiness(
+    relative_files: Mapping[str, bytes],
+) -> str:
+    statuses: list[str] = []
+    for relative, heading in OPENSPEC_READINESS_SECTIONS:
+        try:
+            content = relative_files[relative].decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise InputError(f"OpenSpec {relative} must be valid UTF-8") from exc
+        section = re.search(
+            rf"(?ms)^## {re.escape(heading)}[ \t]*\n(.*?)(?=^## |\Z)",
+            content,
+        )
+        if section is None:
+            raise InputError(
+                f"OpenSpec {relative} is missing required heading: {heading}"
+            )
+        status = OPENSPEC_READINESS_STATUS_RE.search(section.group(1))
+        if status is None:
+            raise InputError(
+                f"OpenSpec {relative} must declare readiness status as "
+                "ready or analysis_required"
+            )
+        statuses.append(status.group(1))
+    if len(set(statuses)) != 1:
+        raise InputError(
+            "OpenSpec decomposition readiness status must match in design.md "
+            "and tasks.md"
+        )
+    return statuses[0]
 
 
 def _openspec_fingerprint(change_dir: Path) -> str:
@@ -648,6 +687,19 @@ def build_campaign(
         task["kind"] == "implementation" and task.get("role") != "finalizer"
         for task in tasks
     )
+    if spec is not None:
+        readiness_files = (
+            spec_files
+            if spec_files is not None
+            else _openspec_directory_files(context.repo_root / spec["path"])
+        )
+        readiness = _openspec_decomposition_readiness(readiness_files)
+        if readiness == "analysis_required" and any(
+            task["kind"] != "analysis" for task in tasks
+        ):
+            raise InputError(
+                "OpenSpec analysis_required permits only analysis tasks"
+            )
     if mode == "delivery" and spec is None and (
         risk == "high"
         or implementation_count > 1

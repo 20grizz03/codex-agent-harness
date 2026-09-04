@@ -234,6 +234,75 @@ class CampaignTests(unittest.TestCase):
         self.assertIn("версии PHP", live_epic)
         self.assertIn("не блокирует проверки или ревью", live_epic)
 
+    def test_epic_decomposition_requires_technical_readiness(self) -> None:
+        root = _support.PLUGIN_ROOT / "skills/epic-workflow"
+        skill = (root / "SKILL.md").read_text(encoding="utf-8")
+        live_epic = (root / "references/live-epic.md").read_text(
+            encoding="utf-8"
+        )
+        openspec = (root / "references/openspec.md").read_text(
+            encoding="utf-8"
+        )
+        schema_root = root / "assets/openspec-schema/agent-harness"
+        design = (schema_root / "templates/design.md").read_text(
+            encoding="utf-8"
+        )
+        tasks = (schema_root / "templates/tasks.md").read_text(
+            encoding="utf-8"
+        )
+        schema = (schema_root / "schema.yaml").read_text(encoding="utf-8")
+
+        for guidance in (skill, live_epic, openspec, design, tasks, schema):
+            self.assertIn("analysis_required", guidance)
+        self.assertIn("Decomposition Readiness", design)
+        self.assertIn("Проверка готовности декомпозиции", tasks)
+        self.assertIn("компоненты и репозитории", live_epic)
+        self.assertIn("До показа пользователю", openspec)
+        self.assertIn("переразбей её до показа пользователю", live_epic)
+        self.assertIn("Decomposition Readiness заполняй всегда", schema)
+        self.assertIn("удали шаблонные implementation-", tasks)
+
+    def test_new_campaign_requires_openspec_decomposition_readiness(self) -> None:
+        with _support.TempRepo() as repo:
+            arguments = campaign_arguments(
+                repo,
+                tasks=[task("T-1", kind="implementation")],
+                with_spec=True,
+            )
+            design = repo.path / "openspec/changes/add-feature/design.md"
+            design.write_text(
+                design.read_text(encoding="utf-8").replace(
+                    "## Decomposition Readiness\n\nСтатус: ready\n", ""
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(InputError, "Decomposition Readiness"):
+                HarnessService({}).create_campaign(arguments)
+
+    def test_analysis_required_rejects_implementation_tasks(self) -> None:
+        with _support.TempRepo() as repo:
+            arguments = campaign_arguments(
+                repo,
+                tasks=[task("T-1", kind="implementation")],
+                with_spec=True,
+            )
+            for relative in ("design.md", "tasks.md"):
+                path = repo.path / "openspec/changes/add-feature" / relative
+                path.write_text(
+                    path.read_text(encoding="utf-8").replace(
+                        "Статус: ready", "Статус: analysis_required"
+                    ),
+                    encoding="utf-8",
+                )
+
+            with self.assertRaisesRegex(InputError, "only analysis tasks"):
+                HarnessService({}).create_campaign(arguments)
+
+            arguments["tasks"] = [task("A-1", kind="analysis")]
+            campaign = HarnessService({}).create_campaign(arguments)
+            self.assertEqual("analysis", campaign["contract"]["tasks"][0]["kind"])
+
     def test_publication_context_prevents_recursive_handoff(self) -> None:
         protocol = (
             _support.PLUGIN_ROOT / "skills/workflow/references/protocol.md"
