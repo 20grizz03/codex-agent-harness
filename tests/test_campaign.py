@@ -234,6 +234,32 @@ class CampaignTests(unittest.TestCase):
         self.assertIn("версии PHP", live_epic)
         self.assertIn("не блокирует проверки или ревью", live_epic)
 
+    def test_publication_context_prevents_recursive_handoff(self) -> None:
+        protocol = (
+            _support.PLUGIN_ROOT / "skills/workflow/references/protocol.md"
+        ).read_text(encoding="utf-8")
+        live_epic = (
+            _support.PLUGIN_ROOT
+            / "skills/epic-workflow/references/live-epic.md"
+        ).read_text(encoding="utf-8")
+        publication = (
+            _support.PLUGIN_ROOT
+            / "skills/delivery-writing/references/publication-context.md"
+        ).read_text(encoding="utf-8")
+
+        for guidance in (protocol, live_epic, publication):
+            self.assertIn("publication_context", guidance)
+            self.assertIn("scope_id", guidance)
+            self.assertIn("source_run_ids", guidance)
+            self.assertIn("candidates", guidance)
+        self.assertIn(
+            "Do not create a second publication task for the same `run_id` or `scope_id`",
+            protocol,
+        )
+        self.assertIn("не создаёт следующую задачу", live_epic)
+        self.assertIn("не должна вызывать `create_thread`", publication)
+        self.assertIn("не содержит историю его реализации", publication)
+
     def test_bundled_openspec_schema_has_declared_templates(self) -> None:
         root = (
             _support.PLUGIN_ROOT
