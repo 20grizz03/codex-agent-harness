@@ -1,51 +1,60 @@
 # Epic campaigns
 
-Version 2.1 adds a local campaign above the existing v1 run. A campaign orders several implementation, analysis, or delivery tasks without adding a scheduler: Codex uses its native plan and calls the existing v1 workflow for every repository-changing task.
+An Agent Harness campaign orders implementation, analysis, integration, and delivery tasks without adding a scheduler. Codex uses its native plan and delegates each repository-changing task to a separate durable run.
 
-Codex coordinates the campaign and assigns each ready implementation task to a separate native subagent, with at most three task executors active at once. Sequential same-repository tasks end in clean atomic commits and the next task resolves its base through `base_from_task`, so each review stays focused. Dependency-free tasks may also run from the same base SHA in separate worktrees when their expected paths do not overlap. Two or more tasks in one repository require a predeclared `role: integration` run that reviews the combined diff from the original base. The candidate is sealed after integration and before any further edits.
+## Prepared task contract
 
-## State
+The campaign freezes its source, goal, restrictions, risk, OpenSpec fingerprint, runtime version, and ordered tasks. A prepared task may contain:
 
-Campaign state and the approved local OpenSpec snapshot are private Git metadata shared by worktrees:
+- immutable `goal` and `done_when`, plus `constraints`, `non_goals`, and `required_checks`;
+- pinned `contract_refs` objects with required `ref` and `revision` values;
+- `execution.native_model`, `execution.reasoning_effort`, and optional `execution.escalation_model`;
+- `review_budget`, `max_correction_passes`, and `max_critic_retries`;
+- `wave`, local `dependencies`, `base_sha` or `base_from_task`, and publication `dependency_strategy`;
+- repository workspace, role, kind, and expected publication boundary.
 
-```text
-<git-common-dir>/codex-agent-harness/campaigns/<campaign-id>/
-├── contract.json
-├── state.json
-├── events.jsonl
-├── comparison.json
-└── spec/                 # local OpenSpec mode only
-```
+New tasks default to `gpt-5.6-sol` with `high` reasoning effort, two correction passes, and one transient critic retry. A legacy missing correction value remains one pass; a legacy missing critic-retry value remains zero. The runtime default for `execution.escalation_model` is null; an epic plan may explicitly set `gpt-6-astra`. The lead passes the stored native model and effort explicitly when spawning the executor. These values are planning metadata: MCP stores them but does not launch or attest the native model.
 
-The contract freezes the source reference, goal, constraints, ordered tasks, risk, runtime version, and forbidden actions. A campaign-linked v1 run inherits at least that risk and records its own runtime version, base SHA, final HEAD, and diff fingerprint. An OpenSpec reference contains only its storage mode, change ID, repository-relative path, and a server-computed semantic SHA-256. The default `local` mode requires `/openspec` to be ignored by Git and privately snapshots the approved change; task transitions verify both copies. The explicit `repository` mode preserves versioned OpenSpec projects and accepts old references without a storage field. The custom schema requires behavior plus security/data, failure/recovery, operability, compatibility, and UI/source-material decisions. Checkbox state is normalized, while any other content change blocks task progress and candidate sealing. `state.json` tracks task status, provider cooldown, runtime-version checkpoints, sanitized human interventions, operational transition counts, and the sealed candidate.
+A campaign-linked run must use the task goal. It inherits completion criteria, constraints, non-goals, forbidden actions, required checks, pinned references, execution settings, review budget, and recovery budgets. The caller may add criteria, constraints, non-goals, forbidden actions, checks, and references, but cannot override a same-name check or any frozen setting. The approved OpenSpec becomes a pinned `openspec:<change-id>` reference using its semantic SHA-256.
 
-The state path is `prepared → executing → candidate_ready → comparing → complete`. Normal delivery skips `comparing`. Terminal alternatives are `needs_human`, `blocked`, `failed`, and `interrupted`. Integration-dependent implementation tasks remain internal until their combined run completes.
+## Readiness and OpenSpec
 
-## MCP tools
+OpenSpec is required for a large, ambiguous, high-risk, multi-task, or behaviorally complex change. Readiness requires affected components, contract revisions and availability, states and errors, recovery, security, compatibility, rollout, publication, and rollback boundaries. Every requirement maps to at least one task; every task maps to a verification scenario. Ordinary technical choices can remain for the lead. Product, scope, or task-boundary uncertainty becomes an `analysis` task before implementation.
 
-- `create_campaign`, `get_campaign`, and `list_campaigns` manage the immutable contract and current state.
-- `record_campaign_task` enforces dependency order, chained bases, minimum campaign risk, clean predecessor commits, and the combined integration run. `needs_human` additionally requires a real unresolved human action or decision; operational failures use `blocked` or `interrupted`.
-- `record_campaign_intervention` stores only actual blocking questions, approvals, corrections, supplied context, and external unblocks. Status requests and task transitions are counted separately.
-- `seal_campaign_candidate` freezes the agent's own result after every task and blocker is closed. It records a Git fingerprint per worktree and rejects changed paths that are not covered by completed v1 runs.
-- `record_campaign_comparison` records cutoff-contract fidelity, historical similarity, gap attribution, residual risks, and `unsafe | partial | ready` candidate readiness after sealing.
-- `finish_campaign` reports `evaluated` for replay and `locally_ready` for delivery. Its result never authorizes Jira, GitHub, deployment, or migration actions.
+The default local OpenSpec mode keeps `/openspec` ignored and snapshots the approved change in private Git metadata. Explicit `storage: repository` preserves versioned OpenSpec and its finalization run. Checkbox state is normalized; another content change blocks task progress and candidate sealing. The 300–700 production-line budget remains advisory and is reported separately from tests, documentation, configuration, generated files, and binaries.
 
-Campaign-linked model stages share an Anthropic cooldown. During the interval the server does not invoke Claude: a critic gets an explicit limit terminal that enables the bounded Codex fallback, while an explicitly selected Claude implementation ends as an operational failure without fallback. After expiry exactly one next model stage probes Claude; a successful probe closes the circuit and another confirmed limit extends it. The default interval is one hour and can be changed with `AGENT_HARNESS_ANTHROPIC_COOLDOWN_SECONDS` from 1 to 14,400 seconds. Plugin upgrades are allowed between task waves with no active probe, and every run retains the version with which it started; a detectable downgrade is rejected.
+## Waves and integration
 
-## Publication handoff
+`wave` and `dependencies` control local implementation. Independent tasks in one wave may run from the same base in separate worktrees when expected paths do not overlap. When a repository has two or more implementation tasks, each of its waves ends with a predeclared `kind: implementation`, `role: integration` task for that wave. That run freezes the wave's source task IDs and commit SHAs, combines them with checked merge commits, verifies that every source SHA is an ancestor, and runs full checks plus its own independent review. The next wave starts from this verified integration commit.
 
-As soon as an independently publishable Jira task completes its run, it moves to a fresh user-visible Codex publication task with a compact verified handoff; sibling tasks and the campaign may continue in parallel. Several implementation tasks that intentionally share one pull request wait only for their integration run, not for campaign completion. A campaign task of kind `delivery` prepares only this handoff; it does not duplicate the final publication text. The publication task is created only when the approved implementation plan explicitly included it.
+`dependency_strategy: parallel | stacked | after_merge` describes PR publication order. It does not replace the local dependency graph. In particular, `after_merge` can defer external publication while local implementation proceeds from a ready verified base. Integration uses `report_only` and is not a product PR.
 
-The handoff starts with `publication_context.active: true`, a stable package `scope_id`, all `source_run_ids`, and the source issue. Every run has its own candidate block that pairs the run workspace, repository, immutable worktree, base and final SHAs, branch and remote references, diff fingerprint, changed paths, and check and review evidence. Shared campaign metadata, residual risks, and proposed external actions stay at package level; the handoff does not inherit the epic conversation or raw logs. The fresh task verifies every persisted run and reads every candidate diff against its paired base before preparing the implementation summary, PR description, and Jira testing recommendations. One mismatch stops the whole package. A campaign never hands off an uncommitted shared worktree that active runs can mutate. After the complete package is shown, `публикуем` authorizes only the listed local branch or commit, push, PR, and publication of the shown Jira testing-recommendations block. The publication task owns package preparation, added related candidates, CI, review feedback, deployment status, and deployment-failure diagnosis for that scope; it never creates another user-visible task for the same `run_id` or `scope_id`.
+At most three implementation executors run at once. Every executor gets its stored model and effort, its own worktree, run, checks, review history, and atomic commit. Campaign state records task transitions and sanitized interventions; it never stores raw connector responses, model streams, credentials, or environment values.
 
-## Jira and GitHub Enterprise
+## Checks, review, and recovery
 
-The plugin process contains no Jira or GitHub client. The `epic-workflow` skill uses purpose-built connectors already available to Codex for issue and PR metadata, and local Git over SSH for repository history. External writes always require a separate explicit user instruction.
+The run fingerprint covers the full result from the frozen base: committed changes, index, working tree, and untracked files without mutating the index. Any change invalidates earlier checks and current review.
 
-For a closed-epic replay, a curator reconstructs the input at a cutoff before implementation. The executor cannot use final statuses, late comments, testing recommendations, linked PRs or commits, or historical diffs until its candidate is sealed. A fresh evaluator separately scores fidelity to the cutoff contract and similarity to the historical result, attributes each gap, and states whether the candidate is safe to deliver.
+Corrections are bounded by `max_correction_passes`. Begin a correction with `plan_checks(begin_correction: true)`. Each corrected fingerprint reruns all checks and receives a new independent review; prior cycles remain in `history`. Several edits before the next check/review boundary count as one correction pass.
 
-## OpenSpec
+A critic stage may be retried once only after `transient_timeout` or `transient_process_failure`, by passing the failed stage as `start_stage.retry_stage_id`. The new stage records `retry_of`; repeating the request is idempotent. Authentication, billing, safety, cancellation, invalid output, and model-policy failures are not retryable. A confirmed `anthropic_limit` remains separate: it opens the shared campaign cooldown and permits an explicitly marked fresh `codex_fallback`; one later model stage probes after the cooldown. `AGENT_HARNESS_ANTHROPIC_COOLDOWN_SECONDS` defaults to 3600 and accepts 1 through 14400 seconds. During cooldown a critic receives the marked fallback path, while an explicitly selected Claude writer ends with an operational failure and no fallback. There is no generic provider fallback.
 
-For a live large idea, high-risk or ambiguous change, multi-task epic, or behaviorally complex single task, `epic-workflow` keeps the approved proposal, behavioral deltas, design decisions, and task list under the project's `/openspec`. Complexity includes concurrency, retries or recovery, partial-failure semantics, idempotency or consistency, security-sensitive data, compatibility, and coordination across external integrations. The default mode adds `/openspec/` to the repository's local Git exclude file, so specs stay beside the code without entering commits. A tracked `.gitignore` rule is also accepted. Only a narrow, unambiguous single task skips the separate change. OpenSpec does not replace campaign state: its checkboxes are the plan, while terminal task state and evidence remain in Agent Harness.
+## State and tools
 
-The first OpenSpec task checks actual dependency capabilities, including registry reachability, without requiring VPN as the mechanism. Local mode validates the change before campaign creation and again before sealing, but does not add an archive/finalizer task. Teams that explicitly choose `storage: repository` retain the separate `openspec-finalize` run and versioned archive. OpenSpec is not used for blind replay.
+Campaign files live under `<git-common-dir>/codex-agent-harness/campaigns/<campaign-id>/`; run files live under the target worktree's absolute Git directory. `contract.json` is immutable, `state.json` is atomically replaced, and `events.jsonl` is append-only. Run state tracks `review_cycle` and `critic_retries`; each current review records its `cycle`, `diff_fingerprint`, and Claude `stage_id`, while earlier reviews remain in `history`. The campaign state path is `prepared → executing → candidate_ready → comparing → complete`, with terminal operational alternatives.
+
+`create_campaign`, `get_campaign`, and `list_campaigns` manage the campaign. `record_campaign_task` enforces the dependency graph, verified bases, run completion, and integration. `record_campaign_intervention` stores only actual context, corrections, approvals, external unblocks, and blocking questions. `needs_human` requires a previously recorded unresolved blocking intervention; use `blocked` or `interrupted` for operational failures. `seal_campaign_candidate` freezes covered Git results. Replay then uses `record_campaign_comparison`; `finish_campaign` reports `evaluated` for replay and `locally_ready` for delivery. None authorizes an external write.
+
+Long campaigns may update the plugin only between task waves, with no task in progress and no active Anthropic probe. Each run records its runtime version, and the server rejects a detectable downgrade.
+
+## Publication
+
+The current user-visible task is the default publication context. An independently publishable candidate may be prepared after its run completes; a shared PR waits for the complete integration run. A separate fresh task is created only when the user explicitly chooses that boundary, never merely because the work is ready to publish.
+
+`publication_context.active: true`, its stable `scope_id`, and all `source_run_ids` remain mandatory. Each candidate block keeps its run workspace, repository, immutable worktree, base and final SHAs, branch and remote data, fingerprint, changed paths, check evidence, review origin, diff statistics, and budget status. The publication context verifies every run and reads every complete Git result from its own base. One mismatch stops the whole package.
+
+After local manual verification, the task shows the implementation summary, commit, PR text, Jira testing recommendations, and exact external actions. An unambiguous user instruction authorizes only the named subset. The authorization persists for an unchanged reversible action and its retry after a transient failure. Merge, Jira status, deployment, migration, force-push, and unlisted comments require explicit authority.
+
+## Closed-epic replay
+
+A replay curator reconstructs only the cutoff input. Executors cannot read final statuses, late comments, testing recommendations, linked PRs or commits, or historical diffs before `seal_campaign_candidate`. A fresh evaluator then scores contract fidelity and historical similarity, attributes gaps, and reports candidate readiness. The same prepared-task contracts, waves, checks, review history, cooldown, and recovery rules apply without weakening the historical repository's required checks.

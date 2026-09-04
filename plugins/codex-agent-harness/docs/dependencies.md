@@ -17,11 +17,12 @@ These components are required for a complete implementation run:
 | Component | Purpose | Setup |
 | --- | --- | --- |
 | Codex with plugin support | Runs the workflow and bundled MCP server | Install Codex, then follow the repository README |
+| Native `gpt-5.6-sol` availability | Executes prepared implementation tasks at the stored reasoning effort | Confirm the model is available on the target Codex host before the task wave |
 | Git | Finds the repository, computes diff fingerprints, and isolates dirty worktrees | Install with the operating system developer tools |
 | Python 3 | Runs the bundled MCP server and tests | Make `python3` available on `PATH` |
 | Claude Code CLI | Provides the independent read-only critic | Install Claude Code and run `claude auth login` interactively |
 
-Claude must use first-party subscription OAuth. `check_runtime` rejects API keys, custom Anthropic endpoints, Bedrock, Vertex, and Foundry routing and never invokes a model itself.
+Claude must use first-party subscription OAuth. `check_runtime` rejects API keys, custom Anthropic endpoints, Bedrock, Vertex, and Foundry routing and never invokes a model itself. Native Codex model selection is separate planning metadata; Agent Harness does not launch or attest the selected Codex model.
 
 ## OpenSpec decomposition
 
@@ -49,7 +50,7 @@ Initialize a target repository only when its owners explicitly want versioned sp
 env OPENSPEC_TELEMETRY=0 openspec init
 ```
 
-The setup audit never runs installation, schema copy, or `openspec init`. Repeat the copy command after a plugin update so existing user-level schema files receive new templates and instructions. Agent Harness disables OpenSpec telemetry in every command it invokes. The custom schema requires technical decomposition readiness before implementation tasks, concise Russian content, explicit unresolved questions, behavior and failure contracts, security/data, recovery, operability, compatibility, UI/source material, one independently verifiable functionality per Agent Harness task, an advisory 300–700 production-line target reported separately from tests, documentation, configuration, generated files, and binaries, a capability preflight, and a combined integration run.
+The setup audit never runs installation, schema copy, or `openspec init`. Repeat the copy command after a plugin update so existing user-level schema files receive new templates and instructions. Agent Harness disables OpenSpec telemetry in every command it invokes. The custom schema requires technical decomposition readiness, requirement-to-task-to-scenario coverage, pinned contract revisions and availability checks, concise Russian content, failure and recovery contracts, security/data, compatibility, one independently verifiable functionality per task, an advisory 300–700 production-line target, a capability preflight, and checked integration between parallel waves.
 
 ## Scenario integrations
 
