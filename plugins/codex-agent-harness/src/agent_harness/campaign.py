@@ -12,9 +12,13 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from .budget import normalize_review_budget
-from .contract import DEFAULT_FORBIDDEN_ACTIONS
+from .contract import (
+    DEFAULT_FORBIDDEN_ACTIONS,
+    normalize_contract_refs,
+    normalize_execution,
+)
 from .git_repo import RepoContext, resolve_repo, run_git, status_snapshot
-from .policy import validate_risk
+from .policy import validate_checks, validate_risk
 from .store import RunStore, SCHEMA_VERSION
 from .util import (
     InputError,
@@ -517,6 +521,15 @@ def _tasks(value: Any) -> list[dict[str, Any]]:
                 "base_from_task",
                 "role",
                 "review_budget",
+                "execution",
+                "constraints",
+                "non_goals",
+                "required_checks",
+                "contract_refs",
+                "max_correction_passes",
+                "max_critic_retries",
+                "wave",
+                "dependency_strategy",
             },
         )
         task_id = require_string(task.get("id"), f"tasks[{index}].id", maximum=80)
@@ -582,6 +595,45 @@ def _tasks(value: Any) -> list[dict[str, Any]]:
             normalized["review_budget"] = normalize_review_budget(
                 task.get("review_budget")
             )
+            normalized["execution"] = normalize_execution(task.get("execution"))
+            normalized["constraints"] = _sanitized_string_list(
+                task.get("constraints"), f"tasks[{index}].constraints"
+            )
+            normalized["non_goals"] = _sanitized_string_list(
+                task.get("non_goals"), f"tasks[{index}].non_goals"
+            )
+            normalized["contract_refs"] = normalize_contract_refs(
+                task.get("contract_refs")
+            )
+            normalized["required_checks"] = validate_checks(
+                task.get("required_checks", []), source="campaign_task"
+            )
+            for field, maximum, default in (
+                ("max_correction_passes", 8, 2),
+                ("max_critic_retries", 1, 1),
+            ):
+                raw_limit = task.get(field, default)
+                if not isinstance(raw_limit, int) or isinstance(raw_limit, bool):
+                    raise InputError(f"tasks[{index}].{field} must be an integer")
+                if not 0 <= raw_limit <= maximum:
+                    raise InputError(
+                        f"tasks[{index}].{field} must be between 0 and {maximum}"
+                    )
+                normalized[field] = raw_limit
+            raw_wave = task.get("wave", 1)
+            if not isinstance(raw_wave, int) or isinstance(raw_wave, bool) or raw_wave < 1:
+                raise InputError(f"tasks[{index}].wave must be a positive integer")
+            normalized["wave"] = raw_wave
+            strategy = require_string(
+                task.get("dependency_strategy", "parallel"),
+                f"tasks[{index}].dependency_strategy",
+                maximum=32,
+            )
+            if strategy not in {"parallel", "stacked", "after_merge"}:
+                raise InputError(
+                    f"tasks[{index}].dependency_strategy must be parallel, stacked, or after_merge"
+                )
+            normalized["dependency_strategy"] = strategy
         if task.get("workspace") is not None:
             normalized["workspace"] = require_string(
                 task.get("workspace"),
@@ -682,6 +734,21 @@ def build_campaign(
         else:
             task.setdefault("base_sha", task_context.head_sha)
         task_definitions[task["id"]] = task
+
+    for task in tasks:
+        if task.get("kind") != "implementation" or int(task.get("wave", 1)) == 1:
+            continue
+        base_from_task = task.get("base_from_task")
+        predecessor = task_definitions.get(str(base_from_task))
+        expected_wave = int(task["wave"]) - 1
+        if (
+            not isinstance(predecessor, dict)
+            or predecessor.get("role") != "integration"
+            or int(predecessor.get("wave", 1)) != expected_wave
+        ):
+            raise InputError(
+                "each later wave must use base_from_task from the preceding integration wave"
+            )
 
     implementation_count = sum(
         task["kind"] == "implementation" and task.get("role") != "finalizer"
@@ -821,6 +888,7 @@ def build_campaign(
             }
         },
         "runtime_versions": [],
+        "runtime_wave_versions": {},
         "candidate": None,
         "terminal": None,
     }

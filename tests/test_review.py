@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import json
 import unittest
 
 import _support
 
+from agent_harness.claude_runtime import build_command
+from agent_harness.mcp_server import REVIEW_SCHEMA
 from agent_harness.review import (
+    CRITIC_SYSTEM_PROMPT,
+    REVIEW_FIELD_DESCRIPTIONS,
+    REVIEW_JSON_SCHEMA,
     validate_review,
     validate_review_with_normalization,
 )
@@ -12,6 +18,21 @@ from agent_harness.util import InputError
 
 
 class ReviewNormalizationTests(unittest.TestCase):
+    def test_cli_and_mcp_review_field_rules_match(self) -> None:
+        for schema in (REVIEW_JSON_SCHEMA, REVIEW_SCHEMA):
+            for field, description in REVIEW_FIELD_DESCRIPTIONS.items():
+                self.assertEqual(
+                    description, schema["properties"][field]["description"]
+                )
+
+    def test_critic_cli_receives_schema_and_explicit_verdict_rules(self) -> None:
+        command = build_command(
+            "/fake/claude", profile="critic", model="claude-opus-5"
+        )
+        schema = json.loads(command[command.index("--json-schema") + 1])
+        self.assertEqual(REVIEW_JSON_SCHEMA, schema)
+        self.assertIn(REVIEW_FIELD_DESCRIPTIONS["verdict"], CRITIC_SYSTEM_PROMPT)
+
     def test_findings_override_pass_and_are_preserved(self) -> None:
         source = _support.finding_review()
         source["verdict"] = "pass"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import threading
@@ -25,8 +26,19 @@ from .campaign import (
 )
 from .claude_runtime import ManagedStage
 from .contract import build_contract
-from .git_repo import diff_fingerprint, diff_stats, resolve_repo, status_snapshot
-from .policy import RISK_RANK, plan_checks as build_check_plan, validate_risk
+from .git_repo import (
+    diff_fingerprint,
+    diff_stats,
+    full_diff_check,
+    resolve_repo,
+    status_snapshot,
+)
+from .policy import (
+    RISK_RANK,
+    plan_checks as build_check_plan,
+    validate_checks,
+    validate_risk,
+)
 from .review import build_stage_prompt, validate_review
 from .store import RunStore, SCHEMA_VERSION
 from .util import (
@@ -127,6 +139,72 @@ class HarnessService:
         }
 
     @staticmethod
+    def _replace_current_review(
+        review_file: dict[str, Any],
+        review: dict[str, Any],
+        *,
+        diff_fingerprint: Any,
+        cycle: int,
+        stage_id: str | None = None,
+    ) -> dict[str, Any]:
+        previous_review = review_file.get("review")
+        previous_resolutions = review_file.get("resolutions", {})
+        if isinstance(previous_review, dict):
+            review_file.setdefault("history", []).append(
+                {
+                    "review": previous_review,
+                    "resolutions": previous_resolutions,
+                    "archived_at": utc_now(),
+                }
+            )
+            carried = []
+            for finding in previous_review.get("findings", []):
+                resolution = previous_resolutions.get(finding.get("id"))
+                if not isinstance(resolution, dict) or (
+                    resolution.get("resolved") is not True
+                    or resolution.get("disposition") == "unverified"
+                ):
+                    carried.append(finding)
+            present = {item.get("id") for item in review["findings"]}
+            prior_cycle = previous_review.get("cycle", len(review_file["history"]))
+            for item in carried:
+                carried_item = dict(item)
+                candidate_id = str(carried_item.get("id"))
+                if candidate_id in present:
+                    digest = hashlib.sha256(
+                        f"{prior_cycle}\0{candidate_id}".encode("utf-8")
+                    ).hexdigest()[:12]
+                    prefix = f"prior-c{prior_cycle}-{digest}-"
+                    candidate_id = prefix + candidate_id[: 80 - len(prefix)]
+                    suffix = 2
+                    while candidate_id in present:
+                        suffix_text = f"-{suffix}"
+                        candidate_id = (
+                            prefix
+                            + str(item.get("id"))[
+                                : 80 - len(prefix) - len(suffix_text)
+                            ]
+                            + suffix_text
+                        )
+                        suffix += 1
+                    carried_item["id"] = candidate_id
+                review["findings"].append(carried_item)
+                present.add(candidate_id)
+            if review["findings"] and review["verdict"] == "pass":
+                review["verdict"] = "changes_requested"
+        current = {
+            **review,
+            "diff_fingerprint": diff_fingerprint,
+            "recorded_at": utc_now(),
+            "cycle": cycle,
+        }
+        if stage_id is not None:
+            current["stage_id"] = stage_id
+        review_file["review"] = current
+        review_file["resolutions"] = {}
+        return current
+
+    @staticmethod
     def _stage_key(store: RunStore, run_id: str, stage_id: str) -> tuple[str, str, str]:
         return (str(store.context.git_dir), run_id, stage_id)
 
@@ -214,12 +292,25 @@ class HarnessService:
         return bool(planned) and not missing_or_failed, missing_or_failed
 
     @staticmethod
-    def _codex_fallback_allowed(state: Mapping[str, Any]) -> bool:
+    def _codex_fallback_allowed(
+        state: Mapping[str, Any], *, current_review_recorded: bool = False
+    ) -> bool:
+        review_cycle = state.get("review_cycle")
+        expected_cycle = (
+            review_cycle + (0 if current_review_recorded else 1)
+            if isinstance(review_cycle, int) and not isinstance(review_cycle, bool)
+            else None
+        )
         return any(
             isinstance(stage, dict)
             and stage.get("profile") == "critic"
             and stage.get("lifecycle_state") == "failed"
             and stage.get("failure_kind") == "anthropic_limit"
+            and stage.get("diff_fingerprint") == state.get("diff_fingerprint")
+            and (
+                expected_cycle is None
+                or stage.get("review_cycle") == expected_cycle
+            )
             for stage in state.get("stages", {}).values()
         )
 
@@ -268,6 +359,94 @@ class HarnessService:
             Path(expected_workspace).resolve() != context.repo_root
         ):
             raise StateError("campaign task workspace does not match run workspace")
+
+        task_goal = str(definition.get("goal", ""))
+        supplied_goal = arguments.get("goal")
+        modern_task = "execution" in definition
+        if modern_task and supplied_goal is not None and supplied_goal != task_goal:
+            raise InputError("run goal conflicts with the campaign task")
+        arguments["goal"] = task_goal if supplied_goal is None else supplied_goal
+
+        for field in ("done_when", "constraints", "non_goals"):
+            if not modern_task and arguments.get(field) is not None:
+                continue
+            inherited: list[str] = []
+            if field != "done_when":
+                inherited.extend(campaign_contract.get(field, []))
+            inherited.extend(definition.get(field, []))
+            supplied = arguments.get(field, [])
+            if supplied is not None:
+                if not isinstance(supplied, list):
+                    raise InputError(f"{field} must be an array")
+                inherited.extend(supplied)
+            arguments[field] = list(dict.fromkeys(inherited))
+
+        inherited_forbidden = [
+            *campaign_contract.get("forbidden_actions", []),
+            *arguments.get("forbidden_actions", []),
+        ]
+        arguments["forbidden_actions"] = list(dict.fromkeys(inherited_forbidden))
+
+        task_refs = list(definition.get("contract_refs", []))
+        spec = campaign_contract.get("spec")
+        if isinstance(spec, Mapping):
+            task_refs.append(
+                {
+                    "ref": f"openspec:{spec.get('change_id')}",
+                    "revision": str(spec.get("sha256")),
+                }
+            )
+        supplied_refs = arguments.get("contract_refs", [])
+        if supplied_refs is not None:
+            if not isinstance(supplied_refs, list):
+                raise InputError("contract_refs must be an array")
+            task_refs.extend(supplied_refs)
+        unique_refs: list[dict[str, Any]] = []
+        seen_refs: set[tuple[Any, Any]] = set()
+        for reference in task_refs:
+            if not isinstance(reference, Mapping):
+                raise InputError("contract_refs entries must be objects")
+            key = (reference.get("ref"), reference.get("revision"))
+            if key not in seen_refs:
+                unique_refs.append(dict(reference))
+                seen_refs.add(key)
+        arguments["contract_refs"] = unique_refs
+
+        task_execution = definition.get("execution")
+        if isinstance(task_execution, Mapping):
+            supplied_execution = arguments.get("execution")
+            if supplied_execution is not None and supplied_execution != task_execution:
+                raise InputError("run execution conflicts with the campaign task")
+            arguments["execution"] = dict(task_execution)
+
+        for field in ("max_correction_passes", "max_critic_retries"):
+            if field not in definition:
+                if not modern_task and arguments.get(field) is None:
+                    arguments[field] = (
+                        1 if field == "max_correction_passes" else 0
+                    )
+                continue
+            supplied = arguments.get(field)
+            if supplied is not None and supplied != definition[field]:
+                raise InputError(f"run {field} conflicts with the campaign task")
+            arguments[field] = definition[field]
+
+        inherited_checks = list(definition.get("required_checks", []))
+        supplied_checks = list(arguments.get("required_checks", []) or [])
+        normalized_checks = validate_checks(
+            [*inherited_checks, *supplied_checks], source="contract"
+        )
+        by_name: dict[str, dict[str, Any]] = {}
+        for check in normalized_checks:
+            existing = by_name.get(check["name"])
+            if existing is not None and (
+                existing["argv"], existing["timeout_seconds"]
+            ) != (check["argv"], check["timeout_seconds"]):
+                raise InputError(
+                    f"run check {check['name']} conflicts with the campaign task"
+                )
+            by_name[check["name"]] = check
+        arguments["required_checks"] = list(by_name.values())
 
         base_from_task = definition.get("base_from_task")
         if isinstance(base_from_task, str):
@@ -351,7 +530,45 @@ class HarnessService:
         current = history[-1].get("version") if history else contract.get(
             "runtime_version"
         )
+        tasks = state.get("tasks", {})
+        definitions = {
+            task.get("id"): task
+            for task in contract.get("tasks", [])
+            if isinstance(task, dict) and isinstance(task.get("id"), str)
+        }
+        definition = definitions.get(task_id)
+        wave: int | None = None
+        wave_key: str | None = None
+        locked_wave_version: str | None = None
+        if isinstance(definition, dict) and "wave" in definition:
+            wave = int(definition["wave"])
+            wave_key = str(wave)
+            wave_versions = state.setdefault("runtime_wave_versions", {})
+            if not isinstance(wave_versions, dict):
+                raise StateError("campaign runtime wave history is corrupt")
+            stored_wave_version = wave_versions.get(wave_key)
+            if stored_wave_version is not None and not isinstance(
+                stored_wave_version, str
+            ):
+                raise StateError("campaign runtime wave history is corrupt")
+            locked_wave_version = stored_wave_version
+            if locked_wave_version is not None and locked_wave_version != version:
+                raise StateError(
+                    "plugin runtime is frozen for the active task wave and may "
+                    "change only between task waves"
+                )
         if current == version:
+            if wave_key is not None and locked_wave_version is None:
+                state["runtime_wave_versions"][wave_key] = version
+                store.save_state(campaign_id, state)
+                store.append_event(
+                    campaign_id,
+                    {
+                        "type": "runtime_wave_frozen",
+                        "wave": wave,
+                        "version": version,
+                    },
+                )
             return
         if version == "unknown":
             raise StateError("campaign plugin runtime version is unknown")
@@ -365,7 +582,6 @@ class HarnessService:
             and version_order < current_order
         ):
             raise StateError("campaign plugin runtime cannot be downgraded")
-        tasks = state.get("tasks", {})
         active = [
             other_id
             for other_id, task in tasks.items()
@@ -373,6 +589,37 @@ class HarnessService:
             and isinstance(task, dict)
             and task.get("status") == "in_progress"
         ]
+        if wave is not None:
+            started_in_wave = [
+                other_id
+                for other_id, other_definition in definitions.items()
+                if other_id != task_id
+                and other_definition.get("kind") == "implementation"
+                and "wave" in other_definition
+                and int(other_definition.get("wave", 1)) == wave
+                and isinstance(tasks.get(other_id), dict)
+                and tasks[other_id].get("status") != "pending"
+            ]
+            if started_in_wave:
+                raise StateError(
+                    "plugin runtime may change only between task waves, before "
+                    "a task wave starts"
+                )
+            if wave > 1:
+                predecessor_id = definition.get("base_from_task")
+                predecessor = definitions.get(predecessor_id)
+                predecessor_state = tasks.get(predecessor_id)
+                if (
+                    not isinstance(predecessor, dict)
+                    or predecessor.get("role") != "integration"
+                    or int(predecessor.get("wave", 1)) != wave - 1
+                    or not isinstance(predecessor_state, dict)
+                    or predecessor_state.get("status") != "complete"
+                ):
+                    raise StateError(
+                        "plugin runtime may change only after the preceding "
+                        "integration wave completes"
+                    )
         circuit = state.get("provider_circuits", {}).get("anthropic", {})
         if active or (isinstance(circuit, dict) and circuit.get("probe")):
             raise StateError(
@@ -387,11 +634,17 @@ class HarnessService:
                 else "safe_checkpoint_unordered"
             ),
         }
+        if wave_key is not None:
+            state["runtime_wave_versions"][wave_key] = version
         history.append(entry)
         store.save_state(campaign_id, state)
         store.append_event(
             campaign_id,
-            {"type": "runtime_version_adopted", "version": version},
+            {
+                "type": "runtime_version_adopted",
+                "version": version,
+                **({"wave": wave} if wave is not None else {}),
+            },
         )
 
     def create_run(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
@@ -1022,49 +1275,57 @@ class HarnessService:
         }
         gaps: list[str] = []
         for repository in sorted(repositories):
-            feature_ids = {
-                str(task.get("id"))
+            repository_features = [
+                task
                 for task in definitions
                 if task.get("role", "task") == "task"
                 and str(task.get("repository_key") or task.get("workspace"))
                 == repository
-            }
-            if len(feature_ids) < 2:
-                continue
-            integrations = [
-                task
-                for task in definitions
-                if task.get("role") == "integration"
-                and str(task.get("repository_key") or task.get("workspace"))
-                == repository
-                and feature_ids.issubset(set(task.get("dependencies", [])))
             ]
-            valid = False
-            feature_paths: set[str] = set()
-            for feature_id in feature_ids:
-                feature_state = task_states.get(feature_id)
-                feature_run = (
-                    feature_state.get("run")
-                    if isinstance(feature_state, Mapping)
-                    else None
-                )
-                if isinstance(feature_run, Mapping):
-                    feature_paths.update(feature_run.get("changed_paths", []))
-            for integration in integrations:
-                integration_state = task_states.get(str(integration.get("id")))
-                integration_run = (
-                    integration_state.get("run")
-                    if isinstance(integration_state, Mapping)
-                    else None
-                )
-                if not isinstance(integration_run, Mapping):
-                    continue
-                covered = set(integration_run.get("changed_paths", []))
-                if feature_paths.issubset(covered):
-                    valid = True
-                    break
-            if not valid:
-                gaps.append(repository)
+            if len(repository_features) < 2:
+                continue
+            waves = sorted({int(task.get("wave", 1)) for task in repository_features})
+            for wave in waves:
+                features = [
+                    task
+                    for task in repository_features
+                    if int(task.get("wave", 1)) == wave
+                ]
+                feature_ids = {str(task.get("id")) for task in features}
+                integrations = [
+                    task
+                    for task in definitions
+                    if task.get("role") == "integration"
+                    and int(task.get("wave", 1)) == wave
+                    and str(task.get("repository_key") or task.get("workspace"))
+                    == repository
+                    and feature_ids.issubset(set(task.get("dependencies", [])))
+                ]
+                feature_paths: set[str] = set()
+                for feature_id in feature_ids:
+                    feature_state = task_states.get(feature_id)
+                    feature_run = (
+                        feature_state.get("run")
+                        if isinstance(feature_state, Mapping)
+                        else None
+                    )
+                    if isinstance(feature_run, Mapping):
+                        feature_paths.update(feature_run.get("changed_paths", []))
+                valid = False
+                for integration in integrations:
+                    integration_state = task_states.get(str(integration.get("id")))
+                    integration_run = (
+                        integration_state.get("run")
+                        if isinstance(integration_state, Mapping)
+                        else None
+                    )
+                    if isinstance(integration_run, Mapping) and feature_paths.issubset(
+                        set(integration_run.get("changed_paths", []))
+                    ):
+                        valid = True
+                        break
+                if not valid:
+                    gaps.append(f"{repository}:wave:{wave}")
         return gaps
 
     def seal_campaign_candidate(
@@ -1424,6 +1685,9 @@ class HarnessService:
     def plan_checks(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
         store = RunStore.for_workspace(self._workspace(arguments))
         run_id = self._run_id(arguments)
+        begin_correction = arguments.get("begin_correction", False)
+        if not isinstance(begin_correction, bool):
+            raise InputError("begin_correction must be a boolean")
         with self._lock:
             contract = store.read_contract(run_id)
             state = self._recover_interrupted(
@@ -1450,10 +1714,37 @@ class HarnessService:
                 }
 
             phase = state.get("phase")
-            if phase == "reviewing":
-                raise StateError(
-                    "record review dispositions before changing a reviewed diff"
-                )
+            review_summary = state.get("review_summary") or {}
+            reviewed_previous = (
+                isinstance(review_summary, Mapping)
+                and review_summary.get("diff_fingerprint") == previous
+            )
+            if phase == "reviewing" or (
+                phase == "checking" and reviewed_previous
+            ):
+                if not begin_correction:
+                    raise StateError(
+                        "set begin_correction after resolving the current review"
+                    )
+                review_file = store.read_review(run_id)
+                review = review_file.get("review")
+                resolutions = review_file.get("resolutions", {})
+                if not isinstance(review, dict) or review.get("blocking_question"):
+                    raise StateError("current review is not ready for a correction round")
+                unresolved = [
+                    finding.get("id")
+                    for finding in review.get("findings", [])
+                    if not isinstance(resolutions.get(finding.get("id")), dict)
+                    or resolutions[finding.get("id")].get("resolved") is not True
+                    or resolutions[finding.get("id")].get("disposition") == "unverified"
+                ]
+                if unresolved:
+                    raise StateError(
+                        "current review has unresolved findings: "
+                        + ", ".join(str(item) for item in unresolved)
+                    )
+                self._transition(state, "correcting")
+                phase = "correcting"
             if phase == "correcting":
                 review_summary = state.get("review_summary") or {}
                 reviewed_fingerprint = review_summary.get("diff_fingerprint")
@@ -1466,14 +1757,14 @@ class HarnessService:
                     state["terminal"] = {
                         "status": "needs_human",
                         "at": utc_now(),
-                        "summary": "The single correction pass is exhausted",
+                        "summary": "The correction-pass budget is exhausted",
                     }
                     store.save_state(run_id, state)
                     store.append_event(
                         run_id,
                         {"type": "correction_limit_exhausted"},
                     )
-                    raise StateError("the single correction pass is exhausted")
+                    raise StateError("the correction-pass budget is exhausted")
                 state["correction_passes"] = int(
                     state.get("correction_passes", 0)
                 ) + 1
@@ -1504,6 +1795,7 @@ class HarnessService:
                     "risk": risk,
                     "matched_policy_rules": matched,
                     "budget_status": budget_status,
+                    "correction_passes": state.get("correction_passes", 0),
                     "production_lines": statistics["production"]["total"],
                 },
             )
@@ -1542,6 +1834,8 @@ class HarnessService:
                 store, run_id, store.read_state(run_id)
             )
             self._require_open(state)
+            if state.get("phase") != "checking":
+                raise StateError("checks may be recorded only in the checking phase")
             current, _paths = diff_fingerprint(
                 store.context, base_sha=str(contract["base_sha"])
             )
@@ -1556,6 +1850,15 @@ class HarnessService:
             }
             if check_name not in planned:
                 raise StateError(f"check was not in the required plan: {check_name}")
+            if check_name == "git-diff-check" and exit_code == 0:
+                whitespace_errors = full_diff_check(
+                    store.context, base_sha=str(contract["base_sha"])
+                )
+                if whitespace_errors:
+                    exit_code = 1
+                    summary = (
+                        f"full diff contains {len(whitespace_errors)} whitespace error(s)"
+                    )
             result = {
                 "name": check_name,
                 "status": "passed" if exit_code == 0 else "failed",
@@ -1760,8 +2063,10 @@ class HarnessService:
                     stage["error"] = sanitize_text(
                         terminal.get("error"), maximum=1_000
                     )
-                if terminal.get("failure_kind") == "anthropic_limit":
-                    stage["failure_kind"] = "anthropic_limit"
+                if terminal.get("failure_kind"):
+                    stage["failure_kind"] = sanitize_text(
+                        terminal.get("failure_kind"), maximum=80
+                    )
                 profile = stage.get("profile")
                 run_terminal = state.get("terminal")
                 recovered_stage_ids = (
@@ -1785,16 +2090,39 @@ class HarnessService:
                 if preserve_run_terminal:
                     pass
                 elif lifecycle == "completed" and profile == "critic":
+                    current_fingerprint, _paths = diff_fingerprint(
+                        store.context, base_sha=str(contract["base_sha"])
+                    )
+                    if stage.get("diff_fingerprint") != current_fingerprint:
+                        stage["lifecycle_state"] = "failed"
+                        stage["failure_kind"] = "stale_review"
+                        stage["error"] = "Critic result does not describe the current diff"
+                        self._transition(state, "checking")
+                        store.save_state(run_id, state)
+                        store.append_event(
+                            run_id,
+                            {"type": "stale_review_rejected", "stage_id": stage_id},
+                        )
+                        self._record_campaign_provider_terminal(
+                            contract,
+                            run_id,
+                            stage_id,
+                            terminal,
+                        )
+                        return
                     review_value = terminal.get("result")
                     review = validate_review(review_value, origin="claude")
                     review_file = store.read_review(run_id)
-                    review_file["review"] = {
-                        **review,
-                        "diff_fingerprint": stage.get("diff_fingerprint"),
-                        "recorded_at": utc_now(),
-                    }
-                    review_file["resolutions"] = {}
+                    cycle = int(state.get("review_cycle", 0)) + 1
+                    review = self._replace_current_review(
+                        review_file,
+                        review,
+                        diff_fingerprint=stage.get("diff_fingerprint"),
+                        cycle=cycle,
+                        stage_id=stage_id,
+                    )
                     store.save_review(run_id, review_file)
+                    state["review_cycle"] = cycle
                     state["review_summary"] = {
                         "origin": "claude",
                         "verdict": review["verdict"],
@@ -1819,6 +2147,13 @@ class HarnessService:
                     and stage.get("failure_kind") == "anthropic_limit"
                 ):
                     self._transition(state, "reviewing")
+                elif (
+                    lifecycle == "failed"
+                    and profile == "critic"
+                    and stage.get("failure_kind")
+                    in {"transient_timeout", "transient_process_failure"}
+                ):
+                    self._transition(state, "checking")
                 else:
                     self._transition(state, "failed")
                     state["terminal"] = {
@@ -1862,12 +2197,46 @@ class HarnessService:
         )
         if profile not in ("critic", "implement"):
             raise InputError("profile must be critic or implement")
+        retry_stage_id = arguments.get("retry_stage_id")
+        if retry_stage_id is not None:
+            retry_stage_id = require_string(
+                retry_stage_id, "retry_stage_id", maximum=128
+            )
+            if profile != "critic":
+                raise InputError("retry_stage_id is valid only for critic stages")
         with self._lock:
             contract = store.read_contract(run_id)
             state = self._recover_interrupted(
                 store, run_id, store.read_state(run_id)
             )
             self._require_open(state)
+            stages = state.setdefault("stages", {})
+            if retry_stage_id is not None:
+                existing_retry = next(
+                    (
+                        candidate
+                        for candidate in stages.values()
+                        if isinstance(candidate, dict)
+                        and candidate.get("retry_of") == retry_stage_id
+                    ),
+                    None,
+                )
+                if existing_retry is not None:
+                    existing_id = str(existing_retry.get("stage_id"))
+                    active = self._stages.get(
+                        self._stage_key(store, run_id, existing_id)
+                    )
+                    if active is not None:
+                        snapshot = active.poll()
+                        snapshot["deduplicated"] = True
+                        return snapshot
+                    return {
+                        "stage_id": existing_id,
+                        "profile": profile,
+                        "status": existing_retry.get("lifecycle_state"),
+                        "terminal": existing_retry,
+                        "deduplicated": True,
+                    }
             if profile == "critic":
                 if contract.get("writer") != "codex":
                     raise StateError("Claude cannot criticise its own implementation")
@@ -1896,8 +2265,63 @@ class HarnessService:
                 if state.get("phase") != "writing":
                     raise StateError("implement stage may start only in writing phase")
 
-            stage_id = f"{run_id}:{profile}:1"
-            existing = state.get("stages", {}).get(stage_id)
+            if retry_stage_id is not None:
+                retry_source = stages.get(retry_stage_id)
+                if not isinstance(retry_source, dict):
+                    raise StateError("retry_stage_id does not identify a stage")
+                if (
+                    retry_source.get("profile") != "critic"
+                    or retry_source.get("lifecycle_state") != "failed"
+                    or retry_source.get("failure_kind")
+                    not in {"transient_timeout", "transient_process_failure"}
+                ):
+                    raise StateError("critic stage failure is not eligible for retry")
+                if retry_source.get("diff_fingerprint") != state.get("diff_fingerprint"):
+                    raise StateError("critic retry must use the same checked diff")
+                if int(state.get("critic_retries", 0)) >= int(
+                    contract.get("max_critic_retries", 0)
+                ):
+                    raise StateError("critic retry budget is exhausted")
+            else:
+                same_diff = next(
+                    (
+                        candidate
+                        for candidate in stages.values()
+                        if isinstance(candidate, dict)
+                        and candidate.get("profile") == profile
+                        and candidate.get("diff_fingerprint")
+                        == state.get("diff_fingerprint")
+                        and (
+                            profile != "critic"
+                            or candidate.get("review_cycle")
+                            == int(state.get("review_cycle", 0)) + 1
+                        )
+                    ),
+                    None,
+                )
+                if same_diff is not None:
+                    existing_id = str(same_diff.get("stage_id"))
+                    active = self._stages.get(
+                        self._stage_key(store, run_id, existing_id)
+                    )
+                    if active is not None:
+                        snapshot = active.poll()
+                        snapshot["deduplicated"] = True
+                        return snapshot
+                    return {
+                        "stage_id": existing_id,
+                        "profile": profile,
+                        "status": same_diff.get("lifecycle_state"),
+                        "terminal": same_diff,
+                        "deduplicated": True,
+                    }
+
+            stage_number = 1 + sum(
+                isinstance(candidate, dict) and candidate.get("profile") == profile
+                for candidate in stages.values()
+            )
+            stage_id = f"{run_id}:{profile}:{stage_number}"
+            existing = stages.get(stage_id)
             key = self._stage_key(store, run_id, stage_id)
             if isinstance(existing, dict):
                 active = self._stages.get(key)
@@ -1938,6 +2362,7 @@ class HarnessService:
                     "failure_source": "campaign_cooldown",
                     "error": "Anthropic campaign cooldown is active",
                     "telemetry": {},
+                    "review_cycle": int(state.get("review_cycle", 0)) + 1,
                 }
                 state.setdefault("stages", {})[stage_id] = stage_record
                 if profile == "critic":
@@ -1983,7 +2408,11 @@ class HarnessService:
                 "requested_effort": "high",
                 "runtime_version": contract.get("runtime_version", "unknown"),
                 "campaign_probe": limit_action == "probe",
+                "review_cycle": int(state.get("review_cycle", 0)) + 1,
             }
+            if retry_stage_id is not None:
+                stage_record["retry_of"] = retry_stage_id
+                state["critic_retries"] = int(state.get("critic_retries", 0)) + 1
             state.setdefault("stages", {})[stage_id] = stage_record
             if profile == "critic":
                 self._transition(state, "reviewing")
@@ -2020,6 +2449,7 @@ class HarnessService:
             except (InputError, OSError) as exc:
                 current = store.read_state(run_id)
                 current["stages"][stage_id]["lifecycle_state"] = "failed"
+                current["stages"][stage_id]["failure_kind"] = "launch_error"
                 current["stages"][stage_id]["error"] = sanitize_text(
                     str(exc), maximum=1_000
                 )
@@ -2160,6 +2590,13 @@ class HarnessService:
                 store, run_id, store.read_state(run_id)
             )
             self._require_open(state)
+            actual_fingerprint, _paths = diff_fingerprint(
+                store.context, base_sha=str(contract["base_sha"])
+            )
+            if actual_fingerprint != state.get("diff_fingerprint"):
+                raise StateError(
+                    "diff changed after checks were recorded; call plan_checks again"
+                )
             gate_ok, outstanding = self._check_gate(state)
             if not gate_ok:
                 raise StateError(
@@ -2179,48 +2616,53 @@ class HarnessService:
                     "lifecycle_state"
                 ) != "completed":
                     raise StateError("Claude implementation stage is not complete")
-                if review is None:
-                    if supplied_review is None:
-                        raise InputError(
-                            "Codex must supply an independent structured review"
-                        )
-                    review = {
-                        **validate_review(supplied_review, origin="codex"),
-                        "diff_fingerprint": state.get("diff_fingerprint"),
-                        "recorded_at": utc_now(),
-                    }
-                    review_file["review"] = review
-                elif supplied_review is not None:
-                    raise StateError("independent review is already recorded")
+                if supplied_review is not None:
+                    if isinstance(review, dict) and review.get(
+                        "diff_fingerprint"
+                    ) == state.get("diff_fingerprint"):
+                        raise StateError("independent review is already recorded")
+                    cycle = int(state.get("review_cycle", 0)) + 1
+                    review = self._replace_current_review(
+                        review_file,
+                        validate_review(supplied_review, origin="codex"),
+                        diff_fingerprint=state.get("diff_fingerprint"),
+                        cycle=cycle,
+                    )
+                    state["review_cycle"] = cycle
+                elif not isinstance(review, dict) or review.get(
+                    "diff_fingerprint"
+                ) != state.get("diff_fingerprint"):
+                    raise InputError("Codex must supply an independent structured review")
             else:
                 fallback_allowed = self._codex_fallback_allowed(state)
-                if review is None and supplied_review is not None and fallback_allowed:
-                    review = {
-                        **validate_review(supplied_review, origin="codex_fallback"),
-                        "diff_fingerprint": state.get("diff_fingerprint"),
-                        "recorded_at": utc_now(),
-                    }
-                    review_file["review"] = review
+                if supplied_review is not None and fallback_allowed:
+                    if isinstance(review, dict) and review.get(
+                        "diff_fingerprint"
+                    ) == state.get("diff_fingerprint"):
+                        raise StateError("independent review is already recorded")
+                    cycle = int(state.get("review_cycle", 0)) + 1
+                    review = self._replace_current_review(
+                        review_file,
+                        validate_review(supplied_review, origin="codex_fallback"),
+                        diff_fingerprint=state.get("diff_fingerprint"),
+                        cycle=cycle,
+                    )
+                    state["review_cycle"] = cycle
                 elif supplied_review is not None:
                     raise InputError(
                         "a Codex fallback review is accepted only after a confirmed "
                         "Anthropic usage limit"
                     )
-                elif not isinstance(review, dict):
+                elif not isinstance(review, dict) or review.get(
+                    "diff_fingerprint"
+                ) != state.get("diff_fingerprint"):
                     if fallback_allowed:
                         raise StateError(
                             "a fresh Codex fallback review must be supplied"
                         )
                     raise StateError("Claude critic review is not complete")
 
-            correction_review = (
-                int(state.get("correction_passes", 0)) > 0
-                and state.get("phase") in ("checking", "reviewing")
-            )
-            if (
-                review.get("diff_fingerprint") != state.get("diff_fingerprint")
-                and not correction_review
-            ):
+            if review.get("diff_fingerprint") != state.get("diff_fingerprint"):
                 raise StateError("review does not describe the current diff fingerprint")
             finding_ids = {
                 finding["id"]
@@ -2325,11 +2767,16 @@ class HarnessService:
                     stage
                     for stage in state.get("stages", {}).values()
                     if isinstance(stage, dict) and stage.get("profile") == "critic"
+                    and stage.get("diff_fingerprint") == current
                 ]
-                if not critic or critic[0].get("lifecycle_state") != "completed":
+                if not any(
+                    stage.get("lifecycle_state") == "completed" for stage in critic
+                ):
                     blockers.append("Claude critic stage is not complete")
             elif origin == "codex_fallback":
-                if not self._codex_fallback_allowed(state):
+                if not self._codex_fallback_allowed(
+                    state, current_review_recorded=True
+                ):
                     blockers.append(
                         "Codex fallback review lacks a confirmed Anthropic usage limit"
                     )
@@ -2337,10 +2784,7 @@ class HarnessService:
                 blockers.append("review origin is not allowed for a Codex writer")
         elif origin != "codex":
             blockers.append("review origin is not independent from the writer")
-        if (
-            review.get("diff_fingerprint") != current
-            and int(state.get("correction_passes", 0)) == 0
-        ):
+        if review.get("diff_fingerprint") != current:
             blockers.append("review does not describe the current diff")
         if review.get("blocking_question"):
             blockers.append("review has a blocking question")

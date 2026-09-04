@@ -69,6 +69,32 @@ ANTHROPIC_LIMIT_TEXT_RE = re.compile(
     r")",
     re.IGNORECASE,
 )
+NON_RETRYABLE_FAILURE_PATTERNS = (
+    (
+        "authentication",
+        re.compile(
+            r"\b(?:authenticat(?:e|ed|es|ing|ion)|authoriz(?:e|ed|ation)|"
+            r"login|logged out|invalid token)\b",
+            re.I,
+        ),
+    ),
+    (
+        "billing",
+        re.compile(r"\b(?:billing|payment|credit card|api key billing)\b", re.I),
+    ),
+    (
+        "safety",
+        re.compile(
+            r"\b(?:permission denied|sandbox|safety|policy violation)\b", re.I
+        ),
+    ),
+)
+TRANSIENT_PROCESS_FAILURE_RE = re.compile(
+    r"\b(?:connection (?:reset|refused|closed)|temporarily unavailable|"
+    r"temporary service failure|service unavailable|gateway timeout|"
+    r"transport error)\b",
+    re.I,
+)
 
 SANDBOX_SETTINGS = {
     "sandbox": {
@@ -362,6 +388,25 @@ def _result_is_anthropic_limit(payload: Mapping[str, Any] | None) -> bool:
     )
 
 
+def _non_retryable_failure(value: Any) -> str | None:
+    try:
+        rendered = value if isinstance(value, str) else json.dumps(value, ensure_ascii=True)
+    except (TypeError, ValueError):
+        return None
+    for kind, pattern in NON_RETRYABLE_FAILURE_PATTERNS:
+        if pattern.search(rendered[-4096:]):
+            return kind
+    return None
+
+
+def _transient_process_failure(value: Any) -> bool:
+    try:
+        rendered = value if isinstance(value, str) else json.dumps(value, ensure_ascii=True)
+    except (TypeError, ValueError):
+        return False
+    return bool(TRANSIENT_PROCESS_FAILURE_RE.search(rendered[-4096:]))
+
+
 def _actual_models(payload: Mapping[str, Any]) -> list[str]:
     candidates: list[str] = []
     direct = _safe_label(payload.get("model"))
@@ -426,6 +471,7 @@ class ManagedStage:
         self._timed_out = False
         self._result_payload: dict[str, Any] | None = None
         self._failure_kind: str | None = None
+        self._limit_seen = False
         self._stderr_scan_tail = ""
         self._stdout_chars = 0
         self._stderr_chars = 0
@@ -574,9 +620,11 @@ class ManagedStage:
         for chunk in iter(lambda: self.process.stderr.read(4096), ""):
             self._stderr_chars += len(chunk)
             scanned = self._stderr_scan_tail + chunk
-            if self._failure_kind is None and _is_anthropic_limit(scanned):
-                self._failure_kind = "anthropic_limit"
-            self._stderr_scan_tail = scanned[-256:]
+            if _is_anthropic_limit(scanned):
+                self._limit_seen = True
+            if self._failure_kind is None:
+                self._failure_kind = _non_retryable_failure(scanned)
+            self._stderr_scan_tail = scanned[-4096:]
 
     def _terminal_from_result(self, returncode: int) -> dict[str, Any]:
         elapsed_ms = int((time.monotonic() - self._started_monotonic) * 1_000)
@@ -597,8 +645,14 @@ class ManagedStage:
                 "telemetry": telemetry,
             }
         if self._timed_out:
+            failure_kind = (
+                "anthropic_limit"
+                if self._limit_seen
+                else self._failure_kind or "transient_timeout"
+            )
             return {
                 "lifecycle_state": "failed",
+                "failure_kind": failure_kind,
                 "error": "Claude stage timed out",
                 "telemetry": telemetry,
             }
@@ -607,7 +661,7 @@ class ManagedStage:
             and self._result_payload.get("is_error") is True
         )
         if (
-            returncode != 0 and self._failure_kind == "anthropic_limit"
+            returncode != 0 and self._limit_seen
         ) or (
             (returncode != 0 or result_is_error)
             and _result_is_anthropic_limit(self._result_payload)
@@ -619,10 +673,45 @@ class ManagedStage:
                 "returncode": returncode,
                 "telemetry": telemetry,
             }
-        if returncode != 0 or self._result_payload is None:
+        if returncode != 0:
+            failure_kind = self._failure_kind or _non_retryable_failure(
+                self._result_payload
+            )
+            if failure_kind is None and (
+                _transient_process_failure(self._stderr_scan_tail)
+                or _transient_process_failure(self._result_payload)
+            ):
+                failure_kind = "transient_process_failure"
+            if failure_kind is None:
+                failure_kind = "process_failure"
             return {
                 "lifecycle_state": "failed",
+                "failure_kind": failure_kind,
                 "error": "Claude Code invocation failed",
+                "returncode": returncode,
+                "telemetry": telemetry,
+            }
+        if self._result_payload is None:
+            return {
+                "lifecycle_state": "failed",
+                "failure_kind": "invalid_output",
+                "error": "Claude Code returned no valid result",
+                "returncode": returncode,
+                "telemetry": telemetry,
+            }
+        if result_is_error:
+            failure_kind = self._failure_kind or _non_retryable_failure(
+                self._result_payload
+            )
+            if failure_kind is None and (
+                _transient_process_failure(self._stderr_scan_tail)
+                or _transient_process_failure(self._result_payload)
+            ):
+                failure_kind = "transient_process_failure"
+            return {
+                "lifecycle_state": "failed",
+                "failure_kind": failure_kind or "invalid_output",
+                "error": "Claude Code returned no valid result",
                 "returncode": returncode,
                 "telemetry": telemetry,
             }
@@ -641,6 +730,7 @@ class ManagedStage:
         except InputError as exc:
             return {
                 "lifecycle_state": "failed",
+                "failure_kind": "invalid_output",
                 "error": f"Claude structured output was invalid: {exc}",
                 "telemetry": telemetry,
             }
@@ -665,6 +755,7 @@ class ManagedStage:
         if quality == "violated":
             return {
                 "lifecycle_state": "failed",
+                "failure_kind": "quality_floor",
                 "error": "Claude model quality floor was violated",
                 "telemetry": telemetry,
             }
@@ -692,22 +783,30 @@ class ManagedStage:
         with self._lock:
             if self._terminal is not None:
                 return
-            self._terminal = {
+            public_terminal = {
                 "stage_id": self.stage_id,
                 "profile": self.profile,
                 **terminal,
             }
-            public_terminal = dict(self._terminal)
         self._result_payload = None
         self._stderr_scan_tail = ""
-        self._terminal_ready.set()
         self._emit(
             {
                 "type": "stage_terminal",
                 "lifecycle_state": public_terminal["lifecycle_state"],
             }
         )
-        self._on_terminal(public_terminal)
+        try:
+            self._on_terminal(public_terminal)
+        except Exception:
+            # The process lifecycle must remain observable even if persistence
+            # encounters corrupt state or another unexpected local failure.
+            pass
+        finally:
+            # A callback failure must not leave a finished process looking active.
+            with self._lock:
+                self._terminal = public_terminal
+            self._terminal_ready.set()
 
     def _watchdog(self) -> None:
         next_heartbeat = time.monotonic() + self._heartbeat

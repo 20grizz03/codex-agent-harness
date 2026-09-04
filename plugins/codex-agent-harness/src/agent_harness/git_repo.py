@@ -282,6 +282,15 @@ def diff_fingerprint(
     if completed.returncode != 0:
         raise InputError("unable to calculate the Git diff fingerprint")
 
+    cached = run_git(
+        context.repo_root,
+        ["diff", "--cached", "--binary", "--no-ext-diff", base, "--"],
+        text=False,
+        timeout=60,
+    )
+    if cached.returncode != 0:
+        raise InputError("unable to calculate the staged Git diff fingerprint")
+
     names = run_git(
         context.repo_root,
         ["diff", "--name-only", "-z", base, "--"],
@@ -301,10 +310,12 @@ def diff_fingerprint(
         [*diff_paths, *(path for _status, path in records)]
     )
     digest = hashlib.sha256()
-    digest.update(b"agent-harness-diff-v1\0")
+    digest.update(b"agent-harness-diff-v2\0")
     digest.update(base.encode("ascii", errors="strict"))
     digest.update(b"\0")
     digest.update(completed.stdout or b"")
+    digest.update(b"\0cached\0")
+    digest.update(cached.stdout or b"")
 
     for status, relative in sorted(records, key=lambda item: (item[1], item[0])):
         digest.update(status.encode("ascii", errors="replace"))
@@ -315,6 +326,47 @@ def diff_fingerprint(
             _hash_untracked_file(digest, context.repo_root / relative)
             digest.update(b"\0")
     return digest.hexdigest(), paths
+
+
+def full_diff_check(context: RepoContext, *, base_sha: str) -> list[str]:
+    """Return whitespace-error summaries for tracked and untracked current content."""
+
+    issues: list[str] = []
+    for arguments in (
+        ["diff", "--check", base_sha, "--"],
+        ["diff", "--cached", "--check", base_sha, "--"],
+        ["diff", "--check", "--"],
+    ):
+        tracked = run_git(
+            context.repo_root, arguments, text=True, timeout=60
+        )
+        if tracked.returncode not in (0, 2):
+            raise InputError("unable to check tracked Git diff whitespace")
+        issues.extend(
+            line
+            for line in (tracked.stdout or "").splitlines()
+            if re.match(r"^.+:\d+: .+$", line)
+        )
+    for status, relative in _status_records(context):
+        if status != "??":
+            continue
+        candidate = context.repo_root / relative
+        if not candidate.is_file() or candidate.is_symlink():
+            continue
+        checked = run_git(
+            context.repo_root,
+            ["diff", "--no-index", "--check", "--", "/dev/null", f"./{relative}"],
+            text=True,
+            timeout=60,
+        )
+        if checked.returncode not in (0, 1, 2, 3):
+            raise InputError("unable to check untracked Git diff whitespace")
+        issues.extend(
+            line
+            for line in (checked.stdout or "").splitlines()
+            if re.match(r"^.+:\d+: .+$", line)
+        )
+    return list(dict.fromkeys(issues))
 
 
 def _parse_numstat(raw: bytes) -> list[tuple[int | None, int | None, str]]:

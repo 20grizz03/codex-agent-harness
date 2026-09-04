@@ -229,8 +229,28 @@ if mode == "fail":
     print("api_key=super-secret-value", file=sys.stderr)
     print("not-json")
     raise SystemExit(7)
+if mode == "transient_fail":
+    print("transport error: connection reset by peer", file=sys.stderr)
+    raise SystemExit(7)
+if mode == "auth_fail":
+    print("Failed to authenticate", file=sys.stderr)
+    raise SystemExit(7)
+if mode == "missing_result":
+    raise SystemExit(0)
+if mode == "transient_result_error":
+    print(json.dumps({{
+        "type": "result",
+        "is_error": True,
+        "error": "service unavailable",
+    }}), flush=True)
+    raise SystemExit(0)
 if mode == "limit_stderr":
     print("api_key=super-secret-value You've hit your usage limit", file=sys.stderr)
+    raise SystemExit(7)
+if mode == "limit_after_safety":
+    print("permission denied", file=sys.stderr, flush=True)
+    print("x" * 5000, file=sys.stderr, flush=True)
+    print("You've hit your usage limit", file=sys.stderr, flush=True)
     raise SystemExit(7)
 if mode == "limit_result":
     print(json.dumps({{
