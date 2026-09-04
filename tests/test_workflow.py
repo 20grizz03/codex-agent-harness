@@ -11,13 +11,23 @@ from agent_harness.service import HarnessService
 from agent_harness.campaign import CampaignStore
 from agent_harness.review import build_stage_prompt
 from agent_harness.store import RunStore
-from agent_harness.util import StateError
+from agent_harness.util import InputError, StateError
 
 
 def run_planned_checks(
-    service: HarnessService, repo: Path, run_id: str
+    service: HarnessService,
+    repo: Path,
+    run_id: str,
+    *,
+    begin_correction: bool = False,
 ) -> dict:
-    plan = service.plan_checks({"workspace": str(repo), "run_id": run_id})
+    plan = service.plan_checks(
+        {
+            "workspace": str(repo),
+            "run_id": run_id,
+            "begin_correction": begin_correction,
+        }
+    )
     for check in plan["checks"]:
         completed = subprocess.run(
             check["argv"],
@@ -64,6 +74,26 @@ def wait_for_stage(
 
 
 class CodexWriterWorkflowTests(unittest.TestCase):
+    def test_carried_finding_collision_keeps_a_bounded_unique_id(self) -> None:
+        finding = _support.finding_review()["findings"][0]
+        finding["id"] = "x" * 80
+        review_file = {
+            "review": {**_support.finding_review(), "findings": [finding], "cycle": 1},
+            "resolutions": {},
+            "history": [],
+        }
+        current = HarnessService._replace_current_review(
+            review_file,
+            {**_support.finding_review(), "findings": [dict(finding)]},
+            diff_fingerprint="fingerprint",
+            cycle=2,
+        )
+
+        identifiers = [item["id"] for item in current["findings"]]
+        self.assertEqual(2, len(set(identifiers)))
+        self.assertTrue(all(len(item) <= 80 for item in identifiers))
+        self.assertEqual("x" * 80, review_file["history"][0]["review"]["findings"][0]["id"])
+
     def test_late_stage_completion_preserves_explicit_run_terminal(self) -> None:
         with _support.TempRepo() as repo, tempfile.TemporaryDirectory() as directory:
             service = self._service(Path(directory))
@@ -110,6 +140,55 @@ class CodexWriterWorkflowTests(unittest.TestCase):
             )
             self.assertNotIn("error", persisted["stages"][stage_id])
             self.assertIsNone(store.read_review(run_id)["review"])
+
+    def test_stale_review_still_records_campaign_provider_terminal(self) -> None:
+        with _support.TempRepo() as repo:
+            service = HarnessService({})
+            run_id = service.create_run(
+                {
+                    "workspace": str(repo.path),
+                    "goal": "Update docs",
+                    "done_when": ["Docs are current"],
+                }
+            )["contract"]["run_id"]
+            (repo.path / "README.md").write_text("reviewed\n", encoding="utf-8")
+            plan = service.plan_checks(
+                {"workspace": str(repo.path), "run_id": run_id}
+            )
+            store = RunStore.for_workspace(repo.path)
+            stage_id = f"{run_id}:critic:1"
+            state = store.read_state(run_id)
+            state["phase"] = "reviewing"
+            state["stages"] = {
+                stage_id: {
+                    "stage_id": stage_id,
+                    "profile": "critic",
+                    "lifecycle_state": "running",
+                    "diff_fingerprint": plan["diff_fingerprint"],
+                }
+            }
+            store.save_state(run_id, state)
+            (repo.path / "README.md").write_text("changed later\n", encoding="utf-8")
+            calls: list[tuple] = []
+            service._record_campaign_provider_terminal = (  # type: ignore[method-assign]
+                lambda *arguments: calls.append(arguments)
+            )
+
+            service._on_stage_terminal(
+                str(repo.path),
+                run_id,
+                stage_id,
+                {
+                    "lifecycle_state": "completed",
+                    "result": _support.PASS_REVIEW,
+                    "telemetry": {},
+                },
+            )
+
+            self.assertEqual(1, len(calls))
+            persisted = store.read_state(run_id)
+            self.assertEqual("stale_review", persisted["stages"][stage_id]["failure_kind"])
+            self.assertEqual("checking", persisted["phase"])
 
     def test_finish_run_rejects_an_active_model_stage(self) -> None:
         with _support.TempRepo() as repo, tempfile.TemporaryDirectory() as directory:
@@ -385,6 +464,116 @@ class CodexWriterWorkflowTests(unittest.TestCase):
             )
             self.assertTrue(repeated["deduplicated"])
 
+    def test_lead_correction_after_pass_requires_a_fresh_review(self) -> None:
+        with _support.TempRepo() as repo, tempfile.TemporaryDirectory() as directory:
+            service = self._service(Path(directory))
+            run_id = service.create_run(
+                {
+                    "workspace": str(repo.path),
+                    "goal": "Update docs",
+                    "done_when": ["Docs are current"],
+                }
+            )["contract"]["run_id"]
+            path = repo.path / "README.md"
+            path.write_text("first draft\n", encoding="utf-8")
+            run_planned_checks(service, repo.path, run_id)
+            first = service.start_stage(
+                {
+                    "workspace": str(repo.path),
+                    "run_id": run_id,
+                    "profile": "critic",
+                }
+            )
+            wait_for_stage(service, repo.path, run_id, first["stage_id"])
+            _support.wait_until(
+                lambda: service.get_run(
+                    {"workspace": str(repo.path), "run_id": run_id}
+                )["review"]["review"]
+            )
+            service.record_review_resolution(
+                {"workspace": str(repo.path), "run_id": run_id, "resolutions": []}
+            )
+            with self.assertRaisesRegex(StateError, "checking phase"):
+                service.record_check(
+                    {
+                        "workspace": str(repo.path),
+                        "run_id": run_id,
+                        "check_name": "git-diff-check",
+                        "exit_code": 0,
+                        "duration_ms": 1,
+                        "summary": "replayed evidence",
+                    }
+                )
+
+            path.write_text("lead refinement\n", encoding="utf-8")
+            run_planned_checks(
+                service, repo.path, run_id, begin_correction=True
+            )
+            second = service.start_stage(
+                {
+                    "workspace": str(repo.path),
+                    "run_id": run_id,
+                    "profile": "critic",
+                }
+            )
+            wait_for_stage(service, repo.path, run_id, second["stage_id"])
+            current = _support.wait_until(
+                lambda: (
+                    value
+                    if len(value["review"].get("history", [])) == 1
+                    else None
+                )
+                if (
+                    value := service.get_run(
+                        {"workspace": str(repo.path), "run_id": run_id}
+                    )
+                )
+                else None
+            )
+            self.assertEqual(1, current["state"]["correction_passes"])
+            self.assertNotEqual(first["stage_id"], second["stage_id"])
+            service.record_review_resolution(
+                {"workspace": str(repo.path), "run_id": run_id, "resolutions": []}
+            )
+            path.write_text("first draft\n", encoding="utf-8")
+            run_planned_checks(
+                service, repo.path, run_id, begin_correction=True
+            )
+            third = service.start_stage(
+                {
+                    "workspace": str(repo.path),
+                    "run_id": run_id,
+                    "profile": "critic",
+                }
+            )
+            self.assertNotEqual(first["stage_id"], third["stage_id"])
+            wait_for_stage(service, repo.path, run_id, third["stage_id"])
+            _support.wait_until(
+                lambda: len(
+                    service.get_run(
+                        {"workspace": str(repo.path), "run_id": run_id}
+                    )["review"].get("history", [])
+                )
+                == 2
+            )
+            service.record_review_resolution(
+                {"workspace": str(repo.path), "run_id": run_id, "resolutions": []}
+            )
+            state = service.get_run(
+                {"workspace": str(repo.path), "run_id": run_id}
+            )["state"]
+            self.assertEqual(2, state["correction_passes"])
+            self.assertEqual(
+                "complete",
+                service.finish_run(
+                    {
+                        "workspace": str(repo.path),
+                        "run_id": run_id,
+                        "status": "complete",
+                    }
+                )["phase"],
+            )
+
     def test_pass_with_findings_enters_reviewing_without_retry(self) -> None:
         review = _support.finding_review()
         review["verdict"] = "pass"
@@ -514,9 +703,18 @@ class CodexWriterWorkflowTests(unittest.TestCase):
             )
 
             self.assertEqual("failed", terminal["lifecycle_state"])
-            self.assertNotIn("failure_kind", terminal)
+            self.assertEqual("invalid_output", terminal["failure_kind"])
             self.assertEqual(1, len(persisted["state"]["stages"]))
             with self.assertRaises(StateError):
+                service.start_stage(
+                    {
+                        "workspace": str(repo.path),
+                        "run_id": run_id,
+                        "profile": "critic",
+                        "retry_stage_id": stage["stage_id"],
+                    }
+                )
+            with self.assertRaises((InputError, StateError)):
                 service.record_review_resolution(
                     {
                         "workspace": str(repo.path),
@@ -590,6 +788,158 @@ class CodexWriterWorkflowTests(unittest.TestCase):
             critic = next(iter(persisted["state"]["stages"].values()))
             self.assertEqual("anthropic_limit", critic["failure_kind"])
 
+    def test_limit_after_correction_accepts_fresh_fallback_review(self) -> None:
+        with _support.TempRepo() as repo, tempfile.TemporaryDirectory() as directory:
+            service = self._service(Path(directory), _support.finding_review())
+            run_id = service.create_run(
+                {
+                    "workspace": str(repo.path),
+                    "goal": "Update docs",
+                    "done_when": ["Docs are current"],
+                }
+            )["contract"]["run_id"]
+            path = repo.path / "README.md"
+            path.write_text("wrong\n", encoding="utf-8")
+            run_planned_checks(service, repo.path, run_id)
+            first = service.start_stage(
+                {
+                    "workspace": str(repo.path),
+                    "run_id": run_id,
+                    "profile": "critic",
+                }
+            )
+            wait_for_stage(service, repo.path, run_id, first["stage_id"])
+            _support.wait_until(
+                lambda: service.get_run(
+                    {"workspace": str(repo.path), "run_id": run_id}
+                )["review"]["review"]
+            )
+            service.record_review_resolution(
+                {
+                    "workspace": str(repo.path),
+                    "run_id": run_id,
+                    "resolutions": [
+                        {
+                            "finding_id": "F-1",
+                            "disposition": "accepted",
+                            "resolved": False,
+                            "evidence": "Correction is required",
+                        }
+                    ],
+                }
+            )
+
+            path.write_text("fixed\n", encoding="utf-8")
+            run_planned_checks(service, repo.path, run_id)
+            service.environ["FAKE_CLAUDE_MODE"] = "limit_result"
+            limited = service.start_stage(
+                {
+                    "workspace": str(repo.path),
+                    "run_id": run_id,
+                    "profile": "critic",
+                }
+            )
+            terminal = wait_for_stage(
+                service, repo.path, run_id, limited["stage_id"]
+            )
+            self.assertEqual("anthropic_limit", terminal["failure_kind"])
+            result = service.record_review_resolution(
+                {
+                    "workspace": str(repo.path),
+                    "run_id": run_id,
+                    "review": _support.PASS_REVIEW,
+                    "resolutions": [
+                        {
+                            "finding_id": "F-1",
+                            "disposition": "accepted",
+                            "resolved": True,
+                            "evidence": "The corrected diff removes the defect",
+                        }
+                    ],
+                }
+            )
+            self.assertEqual("codex_fallback", result["review"]["review"]["origin"])
+            self.assertEqual(1, len(result["review"]["history"]))
+            self.assertEqual(
+                "complete",
+                service.finish_run(
+                    {
+                        "workspace": str(repo.path),
+                        "run_id": run_id,
+                        "status": "complete",
+                    }
+                )["phase"],
+            )
+
+    def test_old_limit_cannot_authorize_fallback_after_a_b_a_corrections(
+        self,
+    ) -> None:
+        with _support.TempRepo() as repo, tempfile.TemporaryDirectory() as directory:
+            service = self._service(
+                Path(directory), FAKE_CLAUDE_MODE="limit_result"
+            )
+            run_id = service.create_run(
+                {
+                    "workspace": str(repo.path),
+                    "goal": "Update docs",
+                    "done_when": ["Docs are current"],
+                }
+            )["contract"]["run_id"]
+            path = repo.path / "README.md"
+            path.write_text("state A\n", encoding="utf-8")
+            run_planned_checks(service, repo.path, run_id)
+            first = service.start_stage(
+                {
+                    "workspace": str(repo.path),
+                    "run_id": run_id,
+                    "profile": "critic",
+                }
+            )
+            wait_for_stage(service, repo.path, run_id, first["stage_id"])
+            service.record_review_resolution(
+                {
+                    "workspace": str(repo.path),
+                    "run_id": run_id,
+                    "review": _support.PASS_REVIEW,
+                    "resolutions": [],
+                }
+            )
+
+            path.write_text("state B\n", encoding="utf-8")
+            run_planned_checks(service, repo.path, run_id, begin_correction=True)
+            service.environ["FAKE_CLAUDE_MODE"] = "success"
+            second = service.start_stage(
+                {
+                    "workspace": str(repo.path),
+                    "run_id": run_id,
+                    "profile": "critic",
+                }
+            )
+            wait_for_stage(service, repo.path, run_id, second["stage_id"])
+            _support.wait_until(
+                lambda: service.get_run(
+                    {"workspace": str(repo.path), "run_id": run_id}
+                )["state"].get("review_cycle")
+                == 2
+            )
+            service.record_review_resolution(
+                {"workspace": str(repo.path), "run_id": run_id, "resolutions": []}
+            )
+
+            path.write_text("state A\n", encoding="utf-8")
+            run_planned_checks(service, repo.path, run_id, begin_correction=True)
+            with self.assertRaisesRegex(
+                InputError, "only after a confirmed Anthropic usage limit"
+            ):
+                service.record_review_resolution(
+                    {
+                        "workspace": str(repo.path),
+                        "run_id": run_id,
+                        "review": _support.PASS_REVIEW,
+                        "resolutions": [],
+                    }
+                )
+
     def test_campaign_limit_skips_until_one_later_probe_recovers(self) -> None:
         with _support.TempRepo() as repo, tempfile.TemporaryDirectory() as directory:
             _support.prepare_openspec_change(repo, commit=True)
@@ -643,8 +993,6 @@ class CodexWriterWorkflowTests(unittest.TestCase):
                 run = service.create_run(
                     {
                         "workspace": str(repo.path),
-                        "goal": f"Implement {task_id}",
-                        "done_when": [f"{task_id} works"],
                         "allow_dirty": allow_dirty,
                         "campaign": {
                             **campaign_common,
@@ -712,8 +1060,6 @@ class CodexWriterWorkflowTests(unittest.TestCase):
             implement_run = service.create_run(
                 {
                     "workspace": str(repo.path),
-                    "goal": "Implement T-I with Claude",
-                    "done_when": ["T-I works"],
                     "allow_dirty": True,
                     "writer": "claude",
                     "writer_explicit": True,
@@ -803,9 +1149,11 @@ class CodexWriterWorkflowTests(unittest.TestCase):
                 == "closed"
             )
 
-    def test_generic_critic_failure_does_not_enable_fallback(self) -> None:
+    def test_transient_process_failure_retries_once_and_deduplicates(self) -> None:
         with _support.TempRepo() as repo, tempfile.TemporaryDirectory() as directory:
-            service = self._service(Path(directory), FAKE_CLAUDE_MODE="fail")
+            service = self._service(
+                Path(directory), FAKE_CLAUDE_MODE="transient_fail"
+            )
             run_id = service.create_run(
                 {
                     "workspace": str(repo.path),
@@ -823,13 +1171,21 @@ class CodexWriterWorkflowTests(unittest.TestCase):
                 }
             )
             wait_for_stage(service, repo.path, run_id, started["stage_id"])
-            _support.wait_until(
-                lambda: service.get_run(
-                    {"workspace": str(repo.path), "run_id": run_id}
-                )["state"]["phase"]
-                == "failed"
+            persisted = _support.wait_until(
+                lambda: (
+                    current
+                    if (current := service.get_run(
+                        {"workspace": str(repo.path), "run_id": run_id}
+                    ))["state"]["phase"] == "checking"
+                    else None
+                )
             )
-            with self.assertRaises(StateError):
+            self.assertEqual("checking", persisted["state"]["phase"])
+            self.assertEqual(
+                "transient_process_failure",
+                persisted["state"]["stages"][started["stage_id"]]["failure_kind"],
+            )
+            with self.assertRaises((InputError, StateError)):
                 service.record_review_resolution(
                     {
                         "workspace": str(repo.path),
@@ -838,6 +1194,32 @@ class CodexWriterWorkflowTests(unittest.TestCase):
                         "resolutions": [],
                     }
                 )
+            service.environ["FAKE_CLAUDE_MODE"] = "hang"
+            retried = service.start_stage(
+                {
+                    "workspace": str(repo.path),
+                    "run_id": run_id,
+                    "profile": "critic",
+                    "retry_stage_id": started["stage_id"],
+                }
+            )
+            duplicate = service.start_stage(
+                {
+                    "workspace": str(repo.path),
+                    "run_id": run_id,
+                    "profile": "critic",
+                    "retry_stage_id": started["stage_id"],
+                }
+            )
+            self.assertTrue(duplicate["deduplicated"])
+            self.assertEqual(retried["stage_id"], duplicate["stage_id"])
+            service.cancel_stage(
+                {
+                    "workspace": str(repo.path),
+                    "run_id": run_id,
+                    "stage_id": retried["stage_id"],
+                }
+            )
 
     def test_failed_gate_prevents_review(self) -> None:
         with _support.TempRepo() as repo, tempfile.TemporaryDirectory() as directory:
@@ -900,7 +1282,7 @@ class CodexWriterWorkflowTests(unittest.TestCase):
             )["state"]
             self.assertEqual({}, current["check_results"][replanned["diff_fingerprint"]])
 
-    def test_one_correction_reruns_checks_without_second_critic(self) -> None:
+    def test_correction_reruns_checks_and_requires_fresh_critic(self) -> None:
         with _support.TempRepo() as repo, tempfile.TemporaryDirectory() as directory:
             service = self._service(Path(directory), _support.finding_review())
             run_id = service.create_run(
@@ -946,6 +1328,30 @@ class CodexWriterWorkflowTests(unittest.TestCase):
             self.assertNotEqual(
                 first_plan["diff_fingerprint"], second_plan["diff_fingerprint"]
             )
+            second = service.start_stage(
+                {
+                    "workspace": str(repo.path),
+                    "run_id": run_id,
+                    "profile": "critic",
+                }
+            )
+            wait_for_stage(service, repo.path, run_id, second["stage_id"])
+            _support.wait_until(
+                lambda: len(
+                    service.get_run(
+                        {"workspace": str(repo.path), "run_id": run_id}
+                    )["review"].get("history", [])
+                )
+                == 1
+            )
+            current_review = service.get_run(
+                {"workspace": str(repo.path), "run_id": run_id}
+            )["review"]["review"]
+            carried_id = next(
+                finding["id"]
+                for finding in current_review["findings"]
+                if finding["id"] != "F-1"
+            )
             final_resolution = service.record_review_resolution(
                 {
                     "workspace": str(repo.path),
@@ -956,17 +1362,62 @@ class CodexWriterWorkflowTests(unittest.TestCase):
                             "disposition": "accepted",
                             "resolved": True,
                             "evidence": "README.md now matches the contract",
-                        }
+                        },
+                        {
+                            "finding_id": carried_id,
+                            "disposition": "accepted",
+                            "resolved": True,
+                            "evidence": "The prior-cycle finding is also fixed",
+                        },
                     ],
                 }
             )
             self.assertEqual("reviewing", final_resolution["phase"])
+            (repo.path / "README.md").write_text(
+                "correct behavior with lead refinement\n", encoding="utf-8"
+            )
+            third_plan = run_planned_checks(
+                service, repo.path, run_id, begin_correction=True
+            )
+            self.assertNotEqual(
+                second_plan["diff_fingerprint"], third_plan["diff_fingerprint"]
+            )
+            third = service.start_stage(
+                {
+                    "workspace": str(repo.path),
+                    "run_id": run_id,
+                    "profile": "critic",
+                }
+            )
+            wait_for_stage(service, repo.path, run_id, third["stage_id"])
+            _support.wait_until(
+                lambda: len(
+                    service.get_run(
+                        {"workspace": str(repo.path), "run_id": run_id}
+                    )["review"].get("history", [])
+                )
+                == 2
+            )
+            service.record_review_resolution(
+                {
+                    "workspace": str(repo.path),
+                    "run_id": run_id,
+                    "resolutions": [
+                        {
+                            "finding_id": "F-1",
+                            "disposition": "accepted",
+                            "resolved": True,
+                            "evidence": "Lead refinement remains contract-compliant",
+                        }
+                    ],
+                }
+            )
             state = service.get_run(
                 {"workspace": str(repo.path), "run_id": run_id}
             )["state"]
-            self.assertEqual(1, state["correction_passes"])
+            self.assertEqual(2, state["correction_passes"])
             self.assertEqual(
-                1,
+                3,
                 len(
                     [
                         stage
@@ -975,6 +1426,10 @@ class CodexWriterWorkflowTests(unittest.TestCase):
                     ]
                 ),
             )
+            review_file = service.get_run(
+                {"workspace": str(repo.path), "run_id": run_id}
+            )["review"]
+            self.assertEqual(2, len(review_file["history"]))
             finished = service.finish_run(
                 {
                     "workspace": str(repo.path),
@@ -1137,6 +1592,87 @@ class ClaudeWriterWorkflowTests(unittest.TestCase):
                 {"workspace": str(repo.path), "run_id": run_id}
             )["review"]["review"]
             self.assertEqual("codex", review["origin"])
+
+    def test_claude_writer_correction_replaces_stale_codex_review(self) -> None:
+        with _support.TempRepo() as repo, tempfile.TemporaryDirectory() as directory:
+            fake = _support.make_fake_claude(Path(directory))
+            service = HarnessService(
+                _support.fake_environment(
+                    fake,
+                    _support.IMPLEMENT_RESULT,
+                    FAKE_CLAUDE_WRITE_PATH=str(repo.path / "README.md"),
+                    FAKE_CLAUDE_WRITE_CONTENT="first implementation\n",
+                )
+            )
+            run_id = service.create_run(
+                {
+                    "workspace": str(repo.path),
+                    "goal": "Update docs",
+                    "done_when": ["Docs are current"],
+                    "writer": "claude",
+                    "writer_explicit": True,
+                }
+            )["contract"]["run_id"]
+            implement = service.start_stage(
+                {
+                    "workspace": str(repo.path),
+                    "run_id": run_id,
+                    "profile": "implement",
+                }
+            )
+            wait_for_stage(service, repo.path, run_id, implement["stage_id"])
+            _support.wait_until(
+                lambda: service.get_run(
+                    {"workspace": str(repo.path), "run_id": run_id}
+                )["state"]["phase"]
+                == "writing"
+            )
+            run_planned_checks(service, repo.path, run_id)
+            service.record_review_resolution(
+                {
+                    "workspace": str(repo.path),
+                    "run_id": run_id,
+                    "review": _support.finding_review(),
+                    "resolutions": [
+                        {
+                            "finding_id": "F-1",
+                            "disposition": "accepted",
+                            "resolved": False,
+                            "evidence": "The implementation needs a correction",
+                        }
+                    ],
+                }
+            )
+
+            (repo.path / "README.md").write_text("corrected\n", encoding="utf-8")
+            run_planned_checks(service, repo.path, run_id)
+            result = service.record_review_resolution(
+                {
+                    "workspace": str(repo.path),
+                    "run_id": run_id,
+                    "review": _support.PASS_REVIEW,
+                    "resolutions": [
+                        {
+                            "finding_id": "F-1",
+                            "disposition": "accepted",
+                            "resolved": True,
+                            "evidence": "The current diff contains the correction",
+                        }
+                    ],
+                }
+            )
+            self.assertEqual("codex", result["review"]["review"]["origin"])
+            self.assertEqual(1, len(result["review"]["history"]))
+            self.assertEqual(
+                "complete",
+                service.finish_run(
+                    {
+                        "workspace": str(repo.path),
+                        "run_id": run_id,
+                        "status": "complete",
+                    }
+                )["phase"],
+            )
 
 
 if __name__ == "__main__":

@@ -26,6 +26,71 @@ DEFAULT_FORBIDDEN_ACTIONS = [
     "mutate an external account or contact a real person",
 ]
 
+DEFAULT_EXECUTION = {
+    "native_model": "gpt-5.6-sol",
+    "reasoning_effort": "high",
+    "escalation_model": None,
+}
+NATIVE_REASONING_EFFORTS = {"low", "medium", "high", "xhigh", "max", "ultra"}
+
+
+def normalize_execution(value: Any) -> dict[str, Any]:
+    if value is None:
+        return dict(DEFAULT_EXECUTION)
+    if not isinstance(value, dict):
+        raise InputError("execution must be an object")
+    unknown = sorted(set(value) - set(DEFAULT_EXECUTION))
+    if unknown:
+        raise InputError("execution contains unsupported fields: " + ", ".join(unknown))
+    native_model = require_string(
+        value.get("native_model", DEFAULT_EXECUTION["native_model"]),
+        "execution.native_model",
+        maximum=128,
+    )
+    reasoning_effort = require_string(
+        value.get("reasoning_effort", DEFAULT_EXECUTION["reasoning_effort"]),
+        "execution.reasoning_effort",
+        maximum=32,
+    )
+    if reasoning_effort not in NATIVE_REASONING_EFFORTS:
+        raise InputError("execution.reasoning_effort is unsupported")
+    escalation_model = value.get("escalation_model")
+    if escalation_model is not None:
+        escalation_model = require_string(
+            escalation_model, "execution.escalation_model", maximum=128
+        )
+    return {
+        "native_model": native_model,
+        "reasoning_effort": reasoning_effort,
+        "escalation_model": escalation_model,
+    }
+
+
+def normalize_contract_refs(value: Any) -> list[dict[str, str]]:
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > 64:
+        raise InputError("contract_refs must be an array with at most 64 entries")
+    result: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for index, item in enumerate(value):
+        if not isinstance(item, dict) or set(item) != {"ref", "revision"}:
+            raise InputError(
+                f"contract_refs[{index}] must contain exactly ref and revision"
+            )
+        normalized = (
+            require_string(item.get("ref"), f"contract_refs[{index}].ref", maximum=1000),
+            require_string(
+                item.get("revision"),
+                f"contract_refs[{index}].revision",
+                maximum=256,
+            ),
+        )
+        if normalized not in seen:
+            result.append({"ref": normalized[0], "revision": normalized[1]})
+            seen.add(normalized)
+    return result
+
 
 def build_contract(
     arguments: dict[str, Any],
@@ -42,13 +107,16 @@ def build_contract(
             "Claude may be the writer only when writer_explicit is true"
         )
 
-    raw_corrections = arguments.get("max_correction_passes", 1)
-    if (
-        not isinstance(raw_corrections, int)
-        or isinstance(raw_corrections, bool)
-        or raw_corrections not in (0, 1)
-    ):
-        raise InputError("max_correction_passes must be 0 or 1 in v1")
+    raw_corrections = arguments.get("max_correction_passes", 2)
+    if not isinstance(raw_corrections, int) or isinstance(raw_corrections, bool):
+        raise InputError("max_correction_passes must be an integer")
+    if not 0 <= raw_corrections <= 8:
+        raise InputError("max_correction_passes must be between 0 and 8")
+    raw_retries = arguments.get("max_critic_retries", 1)
+    if not isinstance(raw_retries, int) or isinstance(raw_retries, bool):
+        raise InputError("max_critic_retries must be an integer")
+    if raw_retries not in (0, 1):
+        raise InputError("max_critic_retries must be 0 or 1")
 
     dirty = status_snapshot(context)
     allow_dirty = arguments.get("allow_dirty", False)
@@ -105,10 +173,13 @@ def build_contract(
         "writer": writer,
         "writer_explicit": writer_explicit,
         "risk": risk,
+        "execution": normalize_execution(arguments.get("execution")),
+        "contract_refs": normalize_contract_refs(arguments.get("contract_refs")),
         "review_budget": review_budget,
         "review_budget_mode": review_budget_mode,
         "required_checks": frozen_checks,
         "max_correction_passes": raw_corrections,
+        "max_critic_retries": raw_retries,
     }
     state = {
         "schema_version": SCHEMA_VERSION,
@@ -132,6 +203,8 @@ def build_contract(
         "check_results": {},
         "stages": {},
         "correction_passes": 0,
+        "critic_retries": 0,
+        "review_cycle": 0,
         "review_summary": None,
         "terminal": None,
     }

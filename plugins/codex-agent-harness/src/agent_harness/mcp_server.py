@@ -7,6 +7,7 @@ import sys
 from typing import Any, Callable, Mapping
 
 from . import __version__
+from .review import REVIEW_FIELD_DESCRIPTIONS
 from .service import HarnessService
 from .util import HarnessError, InputError, require_string
 
@@ -107,19 +108,23 @@ REVIEW_SCHEMA = {
         "verdict": {
             "type": "string",
             "enum": ["pass", "changes_requested", "blocked"],
+            "description": REVIEW_FIELD_DESCRIPTIONS["verdict"],
         },
         "findings": {
             "type": "array",
+            "description": REVIEW_FIELD_DESCRIPTIONS["findings"],
             "maxItems": 64,
             "items": FINDING_SCHEMA,
         },
         "residual_risks": {
             "type": "array",
+            "description": REVIEW_FIELD_DESCRIPTIONS["residual_risks"],
             "maxItems": 64,
             "items": {"type": "string", "maxLength": 1000},
         },
         "blocking_question": {
             "type": ["string", "null"],
+            "description": REVIEW_FIELD_DESCRIPTIONS["blocking_question"],
             "maxLength": 2000,
         },
     },
@@ -192,6 +197,36 @@ REVIEW_BUDGET_SCHEMA = {
     },
     "additionalProperties": False,
 }
+EXECUTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "native_model": {
+            "type": "string", "minLength": 1, "maxLength": 128,
+            "default": "gpt-5.6-sol",
+        },
+        "reasoning_effort": {
+            "type": "string",
+            "enum": ["low", "medium", "high", "xhigh", "max", "ultra"],
+            "default": "high",
+        },
+        "escalation_model": {
+            "type": ["string", "null"],
+            "minLength": 1,
+            "maxLength": 128,
+            "default": None,
+        },
+    },
+    "additionalProperties": False,
+}
+CONTRACT_REF_SCHEMA = {
+    "type": "object",
+    "required": ["ref", "revision"],
+    "properties": {
+        "ref": {"type": "string", "minLength": 1, "maxLength": 1000},
+        "revision": {"type": "string", "minLength": 1, "maxLength": 256},
+    },
+    "additionalProperties": False,
+}
 CAMPAIGN_TASK_SCHEMA = {
     "type": "object",
     "required": ["id", "title", "goal", "done_when"],
@@ -226,6 +261,27 @@ CAMPAIGN_TASK_SCHEMA = {
             "enum": ["task", "integration", "finalizer"],
         },
         "review_budget": REVIEW_BUDGET_SCHEMA,
+        "execution": EXECUTION_SCHEMA,
+        "constraints": {
+            "type": "array", "maxItems": 64,
+            "items": {"type": "string", "maxLength": 1000},
+        },
+        "non_goals": {
+            "type": "array", "maxItems": 64,
+            "items": {"type": "string", "maxLength": 1000},
+        },
+        "required_checks": {
+            "type": "array", "maxItems": 64, "items": CHECK_SCHEMA,
+        },
+        "contract_refs": {
+            "type": "array", "maxItems": 64, "items": CONTRACT_REF_SCHEMA,
+        },
+        "max_correction_passes": {"type": "integer", "minimum": 0, "maximum": 8},
+        "max_critic_retries": {"type": "integer", "minimum": 0, "maximum": 1},
+        "wave": {"type": "integer", "minimum": 1, "maximum": 64},
+        "dependency_strategy": {
+            "type": "string", "enum": ["parallel", "stacked", "after_merge"],
+        },
     },
     "additionalProperties": False,
 }
@@ -574,7 +630,7 @@ TOOLS: list[dict[str, Any]] = [
         ),
         "inputSchema": {
             "type": "object",
-            "required": ["workspace", "goal", "done_when"],
+            "required": ["workspace"],
             "properties": {
                 "workspace": WORKSPACE,
                 "goal": {"type": "string", "minLength": 1, "maxLength": 12000},
@@ -610,7 +666,14 @@ TOOLS: list[dict[str, Any]] = [
                 "max_correction_passes": {
                     "type": "integer",
                     "minimum": 0,
-                    "maximum": 1,
+                    "maximum": 8,
+                },
+                "max_critic_retries": {
+                    "type": "integer", "minimum": 0, "maximum": 1,
+                },
+                "execution": EXECUTION_SCHEMA,
+                "contract_refs": {
+                    "type": "array", "maxItems": 64, "items": CONTRACT_REF_SCHEMA,
                 },
                 "allow_dirty": {"type": "boolean"},
                 "base_sha": {
@@ -636,7 +699,10 @@ TOOLS: list[dict[str, Any]] = [
         "inputSchema": {
             "type": "object",
             "required": ["workspace", "run_id"],
-            "properties": {"workspace": WORKSPACE, "run_id": RUN_ID},
+            "properties": {
+                "workspace": WORKSPACE,
+                "run_id": RUN_ID,
+            },
             "additionalProperties": False,
         },
         "annotations": _annotations(
@@ -684,7 +750,11 @@ TOOLS: list[dict[str, Any]] = [
         "inputSchema": {
             "type": "object",
             "required": ["workspace", "run_id"],
-            "properties": {"workspace": WORKSPACE, "run_id": RUN_ID},
+            "properties": {
+                "workspace": WORKSPACE,
+                "run_id": RUN_ID,
+                "begin_correction": {"type": "boolean"},
+            },
             "additionalProperties": False,
         },
         "annotations": _annotations(
@@ -737,6 +807,7 @@ TOOLS: list[dict[str, Any]] = [
                 "workspace": WORKSPACE,
                 "run_id": RUN_ID,
                 "profile": {"type": "string", "enum": ["critic", "implement"]},
+                "retry_stage_id": {"type": "string", "minLength": 1, "maxLength": 128},
             },
             "additionalProperties": False,
         },

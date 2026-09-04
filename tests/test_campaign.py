@@ -82,6 +82,86 @@ def complete_run(repo: _support.TempRepo | Path, run_id: str) -> None:
 
 
 class CampaignTests(unittest.TestCase):
+    def test_linked_run_inherits_pinned_task_contract_and_may_only_add(self) -> None:
+        with _support.TempRepo() as repo:
+            definition = task("T-1", kind="implementation")
+            definition.update(
+                {
+                    "constraints": ["task constraint"],
+                    "non_goals": ["task non-goal"],
+                    "required_checks": [
+                        {"name": "unit", "argv": ["python3", "-m", "unittest"]}
+                    ],
+                    "contract_refs": [{"ref": "spec:api", "revision": "sha256:123"}],
+                }
+            )
+            arguments = campaign_arguments(repo, tasks=[definition])
+            arguments["constraints"] = ["campaign constraint"]
+            campaign = HarnessService({}).create_campaign(arguments)
+            campaign_id = campaign["contract"]["campaign_id"]
+            service = HarnessService({})
+            service.record_campaign_task(
+                {
+                    "workspace": str(repo.path),
+                    "campaign_id": campaign_id,
+                    "task_id": "T-1",
+                    "status": "in_progress",
+                }
+            )
+            reference = {
+                "workspace": str(repo.path),
+                "campaign_id": campaign_id,
+                "task_id": "T-1",
+            }
+            run = service.create_run(
+                {
+                    "workspace": str(repo.path),
+                    "campaign": reference,
+                    "done_when": ["extra acceptance"],
+                    "constraints": ["extra constraint"],
+                    "required_checks": [
+                        {"name": "lint", "argv": ["python3", "-m", "compileall", "."]}
+                    ],
+                }
+            )["contract"]
+
+            self.assertEqual("Complete T-1", run["goal"])
+            self.assertEqual("gpt-5.6-sol", run["execution"]["native_model"])
+            self.assertEqual("high", run["execution"]["reasoning_effort"])
+            self.assertIsNone(run["execution"]["escalation_model"])
+            self.assertEqual(2, run["max_correction_passes"])
+            self.assertEqual(1, run["max_critic_retries"])
+            self.assertIn("T-1 is complete", run["done_when"])
+            self.assertIn("extra acceptance", run["done_when"])
+            self.assertEqual(
+                {"campaign constraint", "task constraint", "extra constraint"},
+                set(run["constraints"]),
+            )
+            self.assertEqual({"unit", "lint"}, {item["name"] for item in run["required_checks"]})
+            self.assertEqual(
+                [{"ref": "spec:api", "revision": "sha256:123"}],
+                run["contract_refs"],
+            )
+
+            with self.assertRaisesRegex(InputError, "goal conflicts"):
+                service.create_run(
+                    {
+                        "workspace": str(repo.path),
+                        "campaign": reference,
+                        "goal": "Replace the approved goal",
+                    }
+                )
+            with self.assertRaisesRegex(InputError, "check unit conflicts"):
+                service.create_run(
+                    {
+                        "workspace": str(repo.path),
+                        "campaign": reference,
+                        "required_checks": [
+                            {"name": "unit", "argv": ["true"], "timeout_seconds": 1}
+                        ],
+                    }
+                )
+
     def test_campaign_task_budget_is_frozen_and_inherited(self) -> None:
         with _support.TempRepo() as repo:
             definition = {
@@ -115,8 +195,6 @@ class CampaignTests(unittest.TestCase):
             run = service.create_run(
                 {
                     "workspace": str(repo.path),
-                    "goal": "Implement T-1",
-                    "done_when": ["T-1 works"],
                     "campaign": reference,
                 }
             )
@@ -174,6 +252,9 @@ class CampaignTests(unittest.TestCase):
             contract_path = store.campaign_dir(campaign_id) / "contract.json"
             contract = json.loads(contract_path.read_text(encoding="utf-8"))
             contract["tasks"][0].pop("review_budget")
+            contract["tasks"][0].pop("execution")
+            contract["tasks"][0].pop("max_correction_passes")
+            contract["tasks"][0].pop("max_critic_retries")
             contract_path.write_text(json.dumps(contract), encoding="utf-8")
             service.record_campaign_task(
                 {
@@ -201,6 +282,57 @@ class CampaignTests(unittest.TestCase):
                 "legacy_report_only",
                 run["contract"]["review_budget_mode"],
             )
+            self.assertEqual(1, run["contract"]["max_correction_passes"])
+            self.assertEqual(0, run["contract"]["max_critic_retries"])
+
+    def test_legacy_campaign_task_preserves_explicit_zero_correction_budget(
+        self,
+    ) -> None:
+        with _support.TempRepo() as repo:
+            service = HarnessService({})
+            campaign = service.create_campaign(
+                campaign_arguments(
+                    repo,
+                    tasks=[task("T-1", kind="implementation")],
+                )
+            )
+            campaign_id = campaign["contract"]["campaign_id"]
+            store = CampaignStore.for_workspace(repo.path)
+            contract_path = store.campaign_dir(campaign_id) / "contract.json"
+            contract = json.loads(contract_path.read_text(encoding="utf-8"))
+            for field in (
+                "review_budget",
+                "execution",
+                "max_correction_passes",
+                "max_critic_retries",
+            ):
+                contract["tasks"][0].pop(field)
+            contract_path.write_text(json.dumps(contract), encoding="utf-8")
+            service.record_campaign_task(
+                {
+                    "workspace": str(repo.path),
+                    "campaign_id": campaign_id,
+                    "task_id": "T-1",
+                    "status": "in_progress",
+                }
+            )
+
+            run = service.create_run(
+                {
+                    "workspace": str(repo.path),
+                    "goal": "Complete the legacy task",
+                    "done_when": ["Legacy task works"],
+                    "max_correction_passes": 0,
+                    "campaign": {
+                        "workspace": str(repo.path),
+                        "campaign_id": campaign_id,
+                        "task_id": "T-1",
+                    },
+                }
+            )
+
+            self.assertEqual(0, run["contract"]["max_correction_passes"])
+            self.assertEqual(0, run["contract"]["max_critic_retries"])
 
     def test_complex_single_task_routes_to_openspec_before_run(self) -> None:
         workflow = (
@@ -925,8 +1057,6 @@ class CampaignTests(unittest.TestCase):
             first = service.create_run(
                 {
                     "workspace": str(repo.path),
-                    "goal": "Implement T-1",
-                    "done_when": ["T-1 works"],
                     "risk": "low",
                     "campaign": parent,
                 }
@@ -974,8 +1104,6 @@ class CampaignTests(unittest.TestCase):
             second = service.create_run(
                 {
                     "workspace": str(repo.path),
-                    "goal": "Implement T-2",
-                    "done_when": ["T-2 works"],
                     "campaign": {**parent, "task_id": "T-2"},
                 }
             )
@@ -1013,8 +1141,6 @@ class CampaignTests(unittest.TestCase):
                 run = service.create_run(
                     {
                         "workspace": str(repo.path),
-                        "goal": "Implement T-1",
-                        "done_when": ["T-1 works"],
                         "campaign": {
                             **common,
                             "task_id": "T-1",
@@ -1035,11 +1161,218 @@ class CampaignTests(unittest.TestCase):
                 service.create_run(
                     {
                         "workspace": str(repo.path),
-                        "goal": "Implement T-2",
-                        "done_when": ["T-2 works"],
                         "campaign": {**common, "task_id": "T-2"},
                     }
                 )
+
+    def test_runtime_upgrade_waits_for_the_next_explicit_wave(self) -> None:
+        with _support.TempRepo() as repo, patch(
+            "agent_harness.service._runtime_version",
+            return_value="0.2.1+codex.20260825000000",
+        ):
+            service = HarnessService({})
+            campaign = service.create_campaign(
+                campaign_arguments(
+                    repo,
+                    tasks=[
+                        {**task("A1", kind="implementation"), "wave": 1},
+                        {**task("B1", kind="implementation"), "wave": 1},
+                        {
+                            **task(
+                                "I1",
+                                kind="implementation",
+                                dependencies=["A1", "B1"],
+                            ),
+                            "role": "integration",
+                            "wave": 1,
+                        },
+                        {
+                            **task(
+                                "A2",
+                                kind="implementation",
+                                dependencies=["I1"],
+                            ),
+                            "wave": 2,
+                            "base_from_task": "I1",
+                        },
+                    ],
+                    with_spec=True,
+                )
+            )
+            campaign_id = campaign["contract"]["campaign_id"]
+            common = {"workspace": str(repo.path), "campaign_id": campaign_id}
+            store = CampaignStore.for_workspace(repo.path)
+            state = store.read_state(campaign_id)
+            state["tasks"]["A1"]["status"] = "complete"
+            state["tasks"]["B1"]["status"] = "in_progress"
+            store.save_state(campaign_id, state)
+
+            with patch(
+                "agent_harness.service._runtime_version",
+                return_value="0.2.1+codex.20260825010000",
+            ), self.assertRaisesRegex(StateError, "before a task wave starts"):
+                service.create_run(
+                    {
+                        "workspace": str(repo.path),
+                        "campaign": {**common, "task_id": "B1"},
+                    }
+                )
+
+            state = store.read_state(campaign_id)
+            state["tasks"]["B1"]["status"] = "complete"
+            state["tasks"]["I1"].update(
+                {
+                    "status": "complete",
+                    "run": {"head_sha": _support.git(repo.path, "rev-parse", "HEAD")},
+                }
+            )
+            state["tasks"]["A2"]["status"] = "in_progress"
+            store.save_state(campaign_id, state)
+            with patch(
+                "agent_harness.service._runtime_version",
+                return_value="0.2.1+codex.20260825010000",
+            ):
+                run = service.create_run(
+                    {
+                        "workspace": str(repo.path),
+                        "campaign": {**common, "task_id": "A2"},
+                    }
+                )
+            self.assertEqual(
+                "0.2.1+codex.20260825010000",
+                run["contract"]["runtime_version"],
+            )
+
+    def test_runtime_upgrade_rejects_same_task_retry_inside_frozen_wave(
+        self,
+    ) -> None:
+        with _support.TempRepo() as repo, patch(
+            "agent_harness.service._runtime_version",
+            return_value="0.2.1+codex.20260825000000",
+        ):
+            service = HarnessService({})
+            campaign = service.create_campaign(
+                campaign_arguments(
+                    repo,
+                    tasks=[task("T-1", kind="implementation")],
+                )
+            )
+            campaign_id = campaign["contract"]["campaign_id"]
+            reference = {
+                "workspace": str(repo.path),
+                "campaign_id": campaign_id,
+                "task_id": "T-1",
+            }
+            service.record_campaign_task(
+                {**reference, "status": "in_progress"}
+            )
+            service.create_run(
+                {"workspace": str(repo.path), "campaign": reference}
+            )
+            state = CampaignStore.for_workspace(repo.path).read_state(campaign_id)
+            self.assertEqual(
+                "0.2.1+codex.20260825000000",
+                state["runtime_wave_versions"]["1"],
+            )
+
+            with patch(
+                "agent_harness.service._runtime_version",
+                return_value="0.2.1+codex.20260825010000",
+            ), self.assertRaisesRegex(StateError, "frozen for the active task wave"):
+                service.create_run(
+                    {"workspace": str(repo.path), "campaign": reference}
+                )
+
+    def test_analysis_task_does_not_start_the_first_implementation_wave(
+        self,
+    ) -> None:
+        with _support.TempRepo() as repo, patch(
+            "agent_harness.service._runtime_version",
+            return_value="0.2.1+codex.20260825000000",
+        ):
+            service = HarnessService({})
+            campaign = service.create_campaign(
+                campaign_arguments(
+                    repo,
+                    tasks=[
+                        task("ANALYSIS"),
+                        task("T-1", kind="implementation"),
+                    ],
+                    with_spec=True,
+                )
+            )
+            campaign_id = campaign["contract"]["campaign_id"]
+            store = CampaignStore.for_workspace(repo.path)
+            state = store.read_state(campaign_id)
+            state["tasks"]["ANALYSIS"]["status"] = "complete"
+            state["tasks"]["T-1"]["status"] = "in_progress"
+            store.save_state(campaign_id, state)
+
+            with patch(
+                "agent_harness.service._runtime_version",
+                return_value="0.2.1+codex.20260825010000",
+            ):
+                run = service.create_run(
+                    {
+                        "workspace": str(repo.path),
+                        "campaign": {
+                            "workspace": str(repo.path),
+                            "campaign_id": campaign_id,
+                            "task_id": "T-1",
+                        },
+                    }
+                )
+            self.assertEqual(
+                "0.2.1+codex.20260825010000",
+                run["contract"]["runtime_version"],
+            )
+
+    def test_legacy_campaign_without_waves_keeps_between_task_upgrade(self) -> None:
+        with _support.TempRepo() as repo, patch(
+            "agent_harness.service._runtime_version",
+            return_value="0.2.1+codex.20260825000000",
+        ):
+            service = HarnessService({})
+            campaign = service.create_campaign(
+                campaign_arguments(
+                    repo,
+                    tasks=[
+                        task("T-1", kind="implementation"),
+                        task("T-2", kind="implementation"),
+                    ],
+                    with_spec=True,
+                )
+            )
+            campaign_id = campaign["contract"]["campaign_id"]
+            store = CampaignStore.for_workspace(repo.path)
+            contract_path = store.campaign_dir(campaign_id) / "contract.json"
+            contract = json.loads(contract_path.read_text(encoding="utf-8"))
+            for definition in contract["tasks"]:
+                definition.pop("wave")
+            contract_path.write_text(json.dumps(contract), encoding="utf-8")
+            state = store.read_state(campaign_id)
+            state["tasks"]["T-1"]["status"] = "complete"
+            state["tasks"]["T-2"]["status"] = "in_progress"
+            store.save_state(campaign_id, state)
+
+            with patch(
+                "agent_harness.service._runtime_version",
+                return_value="0.2.1+codex.20260825010000",
+            ):
+                run = service.create_run(
+                    {
+                        "workspace": str(repo.path),
+                        "campaign": {
+                            "workspace": str(repo.path),
+                            "campaign_id": campaign_id,
+                            "task_id": "T-2",
+                        },
+                    }
+                )
+            self.assertEqual(
+                "0.2.1+codex.20260825010000",
+                run["contract"]["runtime_version"],
+            )
 
     def test_campaign_runtime_rejects_a_downgrade(self) -> None:
         with _support.TempRepo() as repo, patch(
@@ -1066,8 +1399,6 @@ class CampaignTests(unittest.TestCase):
                 service.create_run(
                     {
                         "workspace": str(repo.path),
-                        "goal": "Implement T-1",
-                        "done_when": ["T-1 works"],
                         "campaign": common,
                     }
                 )
@@ -1353,6 +1684,89 @@ class CampaignTests(unittest.TestCase):
                 {**common, "summary": "candidate"}
             )
             self.assertEqual("ready", sealed["candidate"]["readiness"])
+
+    def test_two_dependency_waves_seal_from_each_integration_sha(self) -> None:
+        with _support.TempRepo() as repo:
+            service = HarnessService({})
+            tasks = [
+                {**task("A1", kind="implementation"), "wave": 1},
+                {**task("B1", kind="implementation"), "wave": 1},
+                {
+                    **task("I1", kind="implementation", dependencies=["A1", "B1"]),
+                    "wave": 1,
+                    "role": "integration",
+                },
+                {
+                    **task("A2", kind="implementation", dependencies=["I1"]),
+                    "wave": 2,
+                    "base_from_task": "I1",
+                    "dependency_strategy": "after_merge",
+                },
+                {
+                    **task("B2", kind="implementation", dependencies=["I1"]),
+                    "wave": 2,
+                    "base_from_task": "I1",
+                    "dependency_strategy": "after_merge",
+                },
+                {
+                    **task(
+                        "I2",
+                        kind="implementation",
+                        dependencies=["I1", "A2", "B2"],
+                    ),
+                    "wave": 2,
+                    "role": "integration",
+                    "base_from_task": "I1",
+                },
+            ]
+            campaign = service.create_campaign(
+                campaign_arguments(repo, tasks=tasks, with_spec=True)
+            )
+            common = {
+                "workspace": str(repo.path),
+                "campaign_id": campaign["contract"]["campaign_id"],
+            }
+
+            def finish_task(task_id: str, filename: str, *, commit: bool = False) -> str:
+                service.record_campaign_task(
+                    {**common, "task_id": task_id, "status": "in_progress"}
+                )
+                run = service.create_run(
+                    {
+                        "workspace": str(repo.path),
+                        "campaign": {**common, "task_id": task_id},
+                        "allow_dirty": bool(_support.git(repo.path, "status", "--porcelain")),
+                    }
+                )
+                (repo.path / filename).write_text(f"{task_id}\n", encoding="utf-8")
+                if commit:
+                    _support.git(repo.path, "add", "-A")
+                    _support.git(repo.path, "commit", "-m", f"integrate {task_id}")
+                complete_run(repo, run["contract"]["run_id"])
+                service.record_campaign_task(
+                    {
+                        **common,
+                        "task_id": task_id,
+                        "status": "complete",
+                        "run_workspace": str(repo.path),
+                        "run_id": run["contract"]["run_id"],
+                    }
+                )
+                return run["contract"]["run_id"]
+
+            finish_task("A1", "a1.txt")
+            finish_task("B1", "b1.txt")
+            finish_task("I1", "i1.txt", commit=True)
+            finish_task("A2", "a2.txt")
+            finish_task("B2", "b2.txt")
+            finish_task("I2", "i2.txt")
+
+            sealed = service.seal_campaign_candidate(
+                {**common, "summary": "two verified waves"}
+            )
+            self.assertEqual("ready", sealed["candidate"]["readiness"])
+            finished = service.finish_campaign({**common, "status": "complete"})
+            self.assertEqual("complete", finished["terminal"]["status"])
 
     def test_terminal_task_attempt_can_restart_without_losing_history(self) -> None:
         with _support.TempRepo() as repo:

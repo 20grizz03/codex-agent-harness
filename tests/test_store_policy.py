@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import stat
@@ -10,7 +11,12 @@ from pathlib import Path
 import _support
 
 from agent_harness.contract import build_contract
-from agent_harness.git_repo import diff_fingerprint, diff_stats, resolve_repo
+from agent_harness.git_repo import (
+    diff_fingerprint,
+    diff_stats,
+    full_diff_check,
+    resolve_repo,
+)
 from agent_harness.policy import plan_checks, validate_checks
 from agent_harness.service import HarnessService
 from agent_harness.store import RunStore
@@ -135,6 +141,95 @@ class GitFingerprintTests(unittest.TestCase):
                 base_sha=base_sha,
             )
             self.assertEqual(["README.md"], paths)
+
+    def test_fingerprint_tracks_index_blob_when_worktree_is_unchanged(self) -> None:
+        with _support.TempRepo() as repo:
+            base = resolve_repo(repo.path).head_sha
+            path = repo.path / "README.md"
+            path.write_text("staged one\n", encoding="utf-8")
+            _support.git(repo.path, "add", "README.md")
+            path.write_text("fixed worktree\n", encoding="utf-8")
+            first, _paths = diff_fingerprint(resolve_repo(repo.path), base_sha=base)
+
+            blob_source = repo.path / "blob-source"
+            blob_source.write_text("staged two \n", encoding="utf-8")
+            blob = _support.git(repo.path, "hash-object", "-w", str(blob_source))
+            blob_source.unlink()
+            _support.git(
+                repo.path,
+                "update-index",
+                "--cacheinfo",
+                f"100644,{blob},README.md",
+            )
+            second, _paths = diff_fingerprint(resolve_repo(repo.path), base_sha=base)
+
+            self.assertNotEqual(first, second)
+            self.assertEqual("fixed worktree\n", path.read_text(encoding="utf-8"))
+
+    def test_full_diff_check_covers_all_git_states_without_mutating_index(self) -> None:
+        with _support.TempRepo() as repo:
+            context = resolve_repo(repo.path)
+            base = context.head_sha
+            (repo.path / "README.md").write_text("committed bad \n", encoding="utf-8")
+            _support.git(repo.path, "add", "README.md")
+            _support.git(repo.path, "commit", "-m", "bad committed content")
+            (repo.path / "README.md").write_text("staged bad \n", encoding="utf-8")
+            _support.git(repo.path, "add", "README.md")
+            (repo.path / "README.md").write_text("clean worktree\n", encoding="utf-8")
+            (repo.path / "- new file.txt").write_text("untracked bad \n", encoding="utf-8")
+            index_path = Path(_support.git(repo.path, "rev-parse", "--git-path", "index"))
+            if not index_path.is_absolute():
+                index_path = repo.path / index_path
+            before = hashlib.sha256(index_path.read_bytes()).hexdigest()
+
+            issues = full_diff_check(resolve_repo(repo.path), base_sha=base)
+
+            after = hashlib.sha256(index_path.read_bytes()).hexdigest()
+            self.assertEqual(before, after)
+            self.assertTrue(any("README.md" in item for item in issues))
+            self.assertTrue(any("- new file.txt" in item for item in issues))
+
+    def test_full_diff_check_detects_each_git_source_independently(self) -> None:
+        def committed(repo: _support.TempRepo) -> str:
+            (repo.path / "README.md").write_text("committed bad \n", encoding="utf-8")
+            _support.git(repo.path, "add", "README.md")
+            _support.git(repo.path, "commit", "-m", "committed whitespace")
+            return "README.md"
+
+        def staged(repo: _support.TempRepo) -> str:
+            path = repo.path / "README.md"
+            path.write_text("staged bad \n", encoding="utf-8")
+            _support.git(repo.path, "add", "README.md")
+            path.write_text("initial\n", encoding="utf-8")
+            return "README.md"
+
+        def untracked(repo: _support.TempRepo) -> str:
+            name = "- untracked file.txt"
+            (repo.path / name).write_text("untracked bad \n", encoding="utf-8")
+            return name
+
+        for name, prepare in (
+            ("committed", committed),
+            ("staged", staged),
+            ("untracked", untracked),
+        ):
+            with self.subTest(name=name), _support.TempRepo() as repo:
+                context = resolve_repo(repo.path)
+                base = context.head_sha
+                expected_path = prepare(repo)
+                index_path = Path(
+                    _support.git(repo.path, "rev-parse", "--git-path", "index")
+                )
+                if not index_path.is_absolute():
+                    index_path = repo.path / index_path
+                before = hashlib.sha256(index_path.read_bytes()).hexdigest()
+
+                issues = full_diff_check(context, base_sha=base)
+
+                after = hashlib.sha256(index_path.read_bytes()).hexdigest()
+                self.assertEqual(before, after)
+                self.assertEqual(1, len(issues))
+                self.assertTrue(any(expected_path in issue for issue in issues))
 
     def test_run_can_freeze_an_ancestor_as_combined_review_base(self) -> None:
         with _support.TempRepo() as repo:

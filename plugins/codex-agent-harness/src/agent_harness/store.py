@@ -120,6 +120,7 @@ class RunStore:
                 "run_id": contract["run_id"],
                 "review": None,
                 "resolutions": {},
+                "history": [],
             },
         )
         descriptor = os.open(

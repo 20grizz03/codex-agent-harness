@@ -22,6 +22,27 @@ VERDICTS = ("pass", "changes_requested", "blocked")
 FINDINGS_NORMALIZATION_REASON = "findings_present"
 BLOCKING_QUESTION_NORMALIZATION_REASON = "blocking_question_present"
 
+REVIEW_FIELD_DESCRIPTIONS = {
+    "verdict": (
+        '"pass" requires findings=[]. "changes_requested" requires at least one '
+        'finding. Any actionable finding, including P3, rules out "pass". '
+        '"blocked" requires a non-empty blocking_question; keep any confirmed '
+        'findings. Never drop a confirmed finding or move it to residual_risks '
+        'to obtain "pass".'
+    ),
+    "findings": (
+        'Confirmed actionable defects, including P3. Must be empty for "pass" '
+        'and non-empty for "changes_requested". Do not include validation gaps.'
+    ),
+    "residual_risks": (
+        "Uncertainty and validation gaps that are not confirmed actionable defects."
+    ),
+    "blocking_question": (
+        'A non-empty question is required for "blocked"; use null when no '
+        "question prevents a safe conclusion."
+    ),
+}
+
 REVIEW_JSON_SCHEMA: dict[str, Any] = {
     "type": "object",
     "required": [
@@ -31,9 +52,10 @@ REVIEW_JSON_SCHEMA: dict[str, Any] = {
         "blocking_question",
     ],
     "properties": {
-        "verdict": {"type": "string", "enum": list(VERDICTS)},
+        "verdict": {"type": "string", "enum": list(VERDICTS), "description": REVIEW_FIELD_DESCRIPTIONS["verdict"]},
         "findings": {
             "type": "array",
+            "description": REVIEW_FIELD_DESCRIPTIONS["findings"],
             "maxItems": 64,
             "items": {
                 "type": "object",
@@ -62,11 +84,13 @@ REVIEW_JSON_SCHEMA: dict[str, Any] = {
         },
         "residual_risks": {
             "type": "array",
+            "description": REVIEW_FIELD_DESCRIPTIONS["residual_risks"],
             "maxItems": 64,
             "items": {"type": "string", "maxLength": 1_000},
         },
         "blocking_question": {
             "type": ["string", "null"],
+            "description": REVIEW_FIELD_DESCRIPTIONS["blocking_question"],
             "maxLength": 2_000,
         },
     },
@@ -264,13 +288,18 @@ CRITIC_SYSTEM_PROMPT = (
     + """
 Act as a fresh independent critic. You are read-only. Inspect the repository,
 Git diff, surrounding production paths, tests, and relevant history yourself.
+Inspect base-to-worktree, base-to-index, and untracked changes when present so
+the review covers the complete checked Git state.
 Do not edit files. Report only actionable correctness, security, reliability,
 or contract defects with concrete impact and evidence. Do not repeat a known
 failed check as a new finding. Put uncertain validation gaps in residual_risks.
 The review budget is advisory: size alone is not a defect and must not become a
 finding. Review the functional contract and note mixed independent behavior only
 when it creates a concrete correctness, testing, rollout, or rollback risk.
+Choose the verdict only after collecting findings:
 """.strip()
+    + "\n"
+    + REVIEW_FIELD_DESCRIPTIONS["verdict"]
 )
 
 IMPLEMENT_SYSTEM_PROMPT = (

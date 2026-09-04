@@ -286,7 +286,7 @@ class ManagedStageTests(unittest.TestCase):
 
             self.assertEqual("failed", terminal["lifecycle_state"])
             self.assertIn("finding.severity", terminal["error"])
-            self.assertNotIn("failure_kind", terminal)
+            self.assertEqual("invalid_output", terminal["failure_kind"])
             self.assertNotIn("review_normalization", terminal["telemetry"])
 
     def test_stderr_and_invalid_json_are_counted_not_returned(self) -> None:
@@ -302,7 +302,7 @@ class ManagedStageTests(unittest.TestCase):
             self.assertGreater(terminal["telemetry"]["invalid_lines"], 0)
 
     def test_anthropic_limit_is_classified_without_exposing_provider_text(self) -> None:
-        for mode in ("limit_stderr", "limit_result"):
+        for mode in ("limit_stderr", "limit_result", "limit_after_safety"):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
                 stage, events, terminals = self._stage(Path(directory), mode=mode)
                 terminal = _support.wait_until(
@@ -343,6 +343,35 @@ class ManagedStageTests(unittest.TestCase):
             self.assertEqual("interrupted", terminal["lifecycle_state"])
             self.assertEqual(1, len(terminals))
 
+    def test_terminal_remains_observable_when_callback_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake = _support.make_fake_claude(root)
+
+            def fail_to_persist(_terminal: dict) -> None:
+                raise RuntimeError("persistence failed")
+
+            stage = ManagedStage(
+                stage_id="run-test:critic:1",
+                run_id="run-test",
+                profile="critic",
+                command=build_command(
+                    str(fake), profile="critic", model="claude-opus-5"
+                ),
+                cwd=root,
+                prompt="review the repository",
+                environ=_support.fake_environment(fake, _support.PASS_REVIEW),
+                requested_model="claude-opus-5",
+                timeout_seconds=30,
+                heartbeat_seconds=1,
+                stall_seconds=5,
+                on_event=lambda _event: None,
+                on_terminal=fail_to_persist,
+            )
+
+            terminal = _support.wait_until(lambda: stage.poll().get("terminal"))
+            self.assertEqual("completed", terminal["lifecycle_state"])
+
     def test_timeout_is_terminal_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             stage, _events, _terminals = self._stage(
@@ -353,6 +382,21 @@ class ManagedStageTests(unittest.TestCase):
             )
             self.assertEqual("failed", terminal["lifecycle_state"])
             self.assertIn("timed out", terminal["error"])
+            self.assertEqual("transient_timeout", terminal["failure_kind"])
+
+    def test_auth_and_missing_result_are_not_retryable_failures(self) -> None:
+        for mode, expected in (
+            ("auth_fail", "authentication"),
+            ("missing_result", "invalid_output"),
+            ("fail", "process_failure"),
+            ("transient_fail", "transient_process_failure"),
+            ("transient_result_error", "transient_process_failure"),
+        ):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                stage, _events, _terminals = self._stage(Path(directory), mode=mode)
+                terminal = _support.wait_until(lambda: stage.poll().get("terminal"))
+                self.assertEqual("failed", terminal["lifecycle_state"])
+                self.assertEqual(expected, terminal["failure_kind"])
 
 
 if __name__ == "__main__":
