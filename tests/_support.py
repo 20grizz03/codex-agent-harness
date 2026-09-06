@@ -185,7 +185,7 @@ IMPLEMENT_RESULT = {
 
 
 def make_fake_claude(directory: Path) -> Path:
-    executable = directory / "fake-claude"
+    executable = directory / ("fake-claude.cmd" if os.name == "nt" else "fake-claude")
     script = f"""#!{sys.executable}
 import json
 import os
@@ -197,7 +197,10 @@ args = sys.argv[1:]
 if args == ["--version"]:
     print("2.1.220 (fake)")
     raise SystemExit(0)
-if args == ["auth", "status", "--json"]:
+if args in (
+    ["auth", "status", "--json"],
+    ["--safe-mode", "auth", "status", "--json"],
+):
     print(json.dumps({{
         "loggedIn": os.environ.get("FAKE_CLAUDE_LOGGED_IN", "1") == "1",
         "authMethod": "claude.ai",
@@ -212,6 +215,7 @@ if args == ["--help"]:
         "--include-partial-messages", "--verbose", "--permission-mode",
         "--settings", "--strict-mcp-config", "--mcp-config", "--no-chrome",
         "--disable-slash-commands", "--json-schema", "--disallowedTools",
+        "--restricted", "--permission-prompts", "--allowedTools",
     ]
     missing = os.environ.get("FAKE_CLAUDE_MISSING_FLAG", "")
     print(" ".join(flag for flag in flags if flag != missing))
@@ -282,7 +286,14 @@ print(json.dumps({{
     "usage": {{"input_tokens": 10, "output_tokens": 20, "secret": "discard-me"}},
 }}), flush=True)
 """
-    executable.write_text(script, encoding="utf-8")
+    if os.name == "nt":
+        (directory / "fake-claude.py").write_text(script, encoding="utf-8")
+        executable.write_text(
+            f'@echo off\r\nchcp 65001 >nul\r\n"{sys.executable}" "%~dp0fake-claude.py" %*\r\n',
+            encoding="utf-8",
+        )
+    else:
+        executable.write_text(script, encoding="utf-8")
     executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
     return executable
 

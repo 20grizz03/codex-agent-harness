@@ -2,12 +2,13 @@
   "mcpServers": {
     "agent-harness": {
       "command": "python3",
-      "args": ["./scripts/mcp_server.py"],
+      "args": ["-X", "utf8", "./scripts/mcp_server.py"],
       "cwd": ".",
       "env_vars": [
         "PATH",
         "HOME",
         "USER",
+        "SystemRoot",
         "AGENT_HARNESS_CLAUDE_BIN",
         "AGENT_HARNESS_CLAUDE_MODEL",
         "AGENT_HARNESS_TIMEOUT_SECONDS",

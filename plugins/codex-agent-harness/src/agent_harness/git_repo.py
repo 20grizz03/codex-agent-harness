@@ -132,16 +132,21 @@ def run_git(
     timeout: int = 30,
 ) -> subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes]:
     try:
+        options: dict[str, Any] = {
+            "cwd": str(workspace),
+            "env": _git_env(),
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": text,
+            "timeout": timeout,
+            "check": False,
+        }
+        if text:
+            options.update(encoding="utf-8", errors="replace")
         return subprocess.run(
             ["git", *arguments],
-            cwd=str(workspace),
-            env=_git_env(),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=text,
-            timeout=timeout,
-            check=False,
+            **options,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise InputError(f"Git command failed before completion: {exc}") from exc

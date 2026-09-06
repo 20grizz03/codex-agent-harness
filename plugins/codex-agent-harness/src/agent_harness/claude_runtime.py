@@ -49,6 +49,9 @@ REQUIRED_FLAGS = (
     "--disable-slash-commands",
     "--json-schema",
     "--disallowedTools",
+    "--restricted",
+    "--permission-prompts",
+    "--allowedTools",
 )
 SAFE_LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,127}$")
 ANTHROPIC_LIMIT_LABELS = {
@@ -106,6 +109,25 @@ SANDBOX_SETTINGS = {
     "attribution": {"commit": "", "pr": ""},
 }
 
+WINDOWS_CRITIC_SETTINGS = {
+    "sandbox": {"enabled": False},
+    "autoMemoryEnabled": False,
+    "attribution": {"commit": "", "pr": ""},
+}
+
+CRITIC_ALLOWED_TOOLS = (
+    "Read",
+    "Glob",
+    "Grep",
+    "Bash(git diff:*)",
+    "Bash(git status:*)",
+    "Bash(git log:*)",
+    "Bash(git show:*)",
+    "Bash(git grep:*)",
+    "Bash(git rev-parse:*)",
+    "Bash(git merge-base:*)",
+)
+
 
 def _truthy(value: str | None) -> bool:
     return bool(value and value.strip().lower() not in {"", "0", "false", "no", "off"})
@@ -140,13 +162,30 @@ def _process_group_kwargs() -> dict[str, Any]:
     return {"start_new_session": True} if os.name == "posix" else {}
 
 
+def _terminate_windows_process_tree(
+    process: subprocess.Popen[str], grace_seconds: float
+) -> bool:
+    try:
+        completed = subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=grace_seconds,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return completed.returncode == 0
+
+
 def terminate_process(process: subprocess.Popen[str], grace_seconds: float = 2.0) -> None:
     if process.poll() is not None:
         return
     try:
         if os.name == "posix":
             os.killpg(process.pid, signal.SIGTERM)
-        else:
+        elif not _terminate_windows_process_tree(process, grace_seconds):
             process.terminate()
     except ProcessLookupError:
         return
@@ -159,7 +198,8 @@ def terminate_process(process: subprocess.Popen[str], grace_seconds: float = 2.0
         if os.name == "posix":
             os.killpg(process.pid, signal.SIGKILL)
         else:
-            process.kill()
+            if not _terminate_windows_process_tree(process, grace_seconds):
+                process.kill()
     except ProcessLookupError:
         return
     process.wait()
@@ -212,7 +252,12 @@ def check_runtime(environ: Mapping[str, str] | None = None) -> dict[str, Any]:
     claude_bin = resolve_claude_bin(effective)
     report: dict[str, Any] = {
         "ok": False,
-        "claude": {"path": claude_bin, "version": None, "auth": None},
+        "claude": {
+            "path": claude_bin,
+            "version": None,
+            "auth": None,
+            "stage_auth": None,
+        },
         "billing_guard": {
             "active_environment": billing,
             "api_billing_allowed": False,
@@ -222,6 +267,11 @@ def check_runtime(environ: Mapping[str, str] | None = None) -> dict[str, Any]:
             "requested_effort": "high",
             "critic_permission_mode": "plan",
             "implement_permission_mode": "auto",
+            "critic_isolation": (
+                "safe-mode+restricted-readonly"
+                if os.name == "nt"
+                else "safe-mode+restricted-readonly+sandbox"
+            ),
         },
         "model_invoked": False,
     }
@@ -230,6 +280,10 @@ def check_runtime(environ: Mapping[str, str] | None = None) -> dict[str, Any]:
         return report
     version = _capture([claude_bin, "--version"], environ=effective)
     auth = _capture([claude_bin, "auth", "status", "--json"], environ=effective)
+    stage_auth = _capture(
+        [claude_bin, "--safe-mode", "auth", "status", "--json"],
+        environ=effective,
+    )
     help_result = _capture([claude_bin, "--help"], environ=effective)
     try:
         auth_object = _json_object(auth.stdout)
@@ -240,6 +294,15 @@ def check_runtime(environ: Mapping[str, str] | None = None) -> dict[str, Any]:
         for key in ("loggedIn", "authMethod", "apiProvider", "subscriptionType")
         if key in auth_object
     }
+    try:
+        stage_auth_object = _json_object(stage_auth.stdout)
+    except InputError:
+        stage_auth_object = {"loggedIn": False, "authMethod": "unknown"}
+    public_stage_auth = {
+        key: stage_auth_object.get(key)
+        for key in ("loggedIn", "authMethod", "apiProvider", "subscriptionType")
+        if key in stage_auth_object
+    }
     help_text = f"{help_result.stdout}\n{help_result.stderr}"
     missing_flags = [flag for flag in REQUIRED_FLAGS if flag not in help_text]
     report["claude"] = {
@@ -248,6 +311,7 @@ def check_runtime(environ: Mapping[str, str] | None = None) -> dict[str, Any]:
             version.stdout or version.stderr, maximum=200
         ),
         "auth": public_auth,
+        "stage_auth": public_stage_auth,
         "required_flags": {
             "ok": help_result.returncode == 0 and not missing_flags,
             "missing": missing_flags,
@@ -261,7 +325,16 @@ def check_runtime(environ: Mapping[str, str] | None = None) -> dict[str, Any]:
         )
     elif not bool(public_auth.get("loggedIn")):
         report["error"] = "Claude Code is not signed in; run claude auth login"
-    elif version.returncode != 0 or auth.returncode != 0:
+    elif not bool(public_stage_auth.get("loggedIn")):
+        report["error"] = (
+            "Claude Code safe-mode is not signed in; run claude auth login "
+            "interactively and verify claude --safe-mode auth status"
+        )
+    elif (
+        version.returncode != 0
+        or auth.returncode != 0
+        or stage_auth.returncode != 0
+    ):
         report["error"] = "Claude Code readiness commands failed"
     elif missing_flags or help_result.returncode != 0:
         report["error"] = "Claude Code is missing required safety flags"
@@ -318,12 +391,14 @@ def build_command(
         denied = "Edit,Write,NotebookEdit"
         schema = REVIEW_JSON_SCHEMA
         system_prompt = CRITIC_SYSTEM_PROMPT
+        settings = WINDOWS_CRITIC_SETTINGS if os.name == "nt" else SANDBOX_SETTINGS
     elif profile == "implement":
         permission_mode = "auto"
         tools = "Read,Glob,Grep,Edit,Write,Bash"
         denied = ""
         schema = IMPLEMENT_JSON_SCHEMA
         system_prompt = IMPLEMENT_SYSTEM_PROMPT
+        settings = SANDBOX_SETTINGS
     else:
         raise InputError("profile must be critic or implement")
     command = [
@@ -338,7 +413,7 @@ def build_command(
         "--tools",
         tools,
         "--settings",
-        json.dumps(SANDBOX_SETTINGS, separators=(",", ":")),
+        json.dumps(settings, separators=(",", ":")),
         "--output-format",
         "stream-json",
         "--verbose",
@@ -358,6 +433,16 @@ def build_command(
         "--append-system-prompt",
         system_prompt,
     ]
+    if profile == "critic":
+        command.extend(
+            [
+                "--restricted",
+                "--permission-prompts",
+                "none",
+                "--allowedTools",
+                ",".join(CRITIC_ALLOWED_TOOLS),
+            ]
+        )
     if denied:
         command.extend(["--disallowedTools", denied])
     return command
