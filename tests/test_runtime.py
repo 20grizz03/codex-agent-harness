@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -29,6 +31,7 @@ class ReadinessTests(unittest.TestCase):
             self.assertFalse(report["model_invoked"])
             self.assertFalse(marker.exists())
             self.assertEqual([], report["billing_guard"]["active_environment"])
+            self.assertTrue(report["claude"]["stage_auth"]["loggedIn"])
 
     def test_billing_environment_blocks_without_exposing_value(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -116,7 +119,13 @@ class CommandTests(unittest.TestCase):
         self.assertIn("--safe-mode", command)
         self.assertIn("--no-session-persistence", command)
         self.assertIn("--strict-mcp-config", command)
+        self.assertIn("--restricted", command)
+        self.assertIn("--permission-prompts none", joined)
+        self.assertIn("Bash(git diff:*)", joined)
         self.assertNotIn("--fallback-model", command)
+        settings = json.loads(command[command.index("--settings") + 1])
+        if os.name == "nt":
+            self.assertFalse(settings["sandbox"]["enabled"])
 
     def test_implement_command_is_distinct(self) -> None:
         command = build_command(

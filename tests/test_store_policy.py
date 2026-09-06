@@ -24,6 +24,21 @@ from agent_harness.util import InputError, StateError
 
 
 class GitFingerprintTests(unittest.TestCase):
+    def test_resolve_repo_supports_non_ascii_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "Дмитрий"
+            path.mkdir()
+            _support.git(path, "init", "-b", "main")
+            _support.git(path, "config", "user.name", "Agent Harness Tests")
+            _support.git(path, "config", "user.email", "tests@example.invalid")
+            (path / "README.md").write_text("initial\n", encoding="utf-8")
+            _support.git(path, "add", "README.md")
+            _support.git(path, "commit", "-m", "initial")
+
+            context = resolve_repo(path)
+
+            self.assertEqual(path.resolve(), context.repo_root)
+
     def test_diff_stats_classify_text_generated_tests_and_binary(self) -> None:
         with _support.TempRepo() as repo:
             files = {
@@ -365,10 +380,16 @@ class StoreTests(unittest.TestCase):
             updated = store.save_state(contract["run_id"], state)
             self.assertEqual(original, (directory / "contract.json").read_bytes())
             self.assertEqual(1, updated["revision"])
-            for name in ("contract.json", "state.json", "review.json", "events.jsonl"):
-                mode = stat.S_IMODE((directory / name).stat().st_mode)
-                self.assertEqual(0o600, mode, name)
-            self.assertEqual(0o700, stat.S_IMODE(directory.stat().st_mode))
+            if os.name != "nt":
+                for name in (
+                    "contract.json",
+                    "state.json",
+                    "review.json",
+                    "events.jsonl",
+                ):
+                    mode = stat.S_IMODE((directory / name).stat().st_mode)
+                    self.assertEqual(0o600, mode, name)
+                self.assertEqual(0o700, stat.S_IMODE(directory.stat().st_mode))
 
     def test_corrupt_state_is_rejected(self) -> None:
         with _support.TempRepo() as repo:

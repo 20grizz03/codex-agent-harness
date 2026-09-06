@@ -71,7 +71,9 @@ class RunStore:
         )
         temporary_path = Path(temporary)
         try:
-            os.fchmod(descriptor, 0o600)
+            fchmod = getattr(os, "fchmod", None)
+            if fchmod is not None:
+                fchmod(descriptor, 0o600)
             with os.fdopen(descriptor, "wb", closefd=False) as stream:
                 stream.write(cls._encoded(value))
                 stream.flush()

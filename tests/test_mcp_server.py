@@ -84,8 +84,10 @@ class McpContractTests(unittest.TestCase):
         enabled = configuration["mcpServers"]["agent-harness"]["enabled_tools"]
         self.assertEqual(EXPECTED_TOOLS, set(enabled))
         self.assertEqual(len(EXPECTED_TOOLS), len(enabled))
-        inherited = configuration["mcpServers"]["agent-harness"]["env_vars"]
-        self.assertTrue({"PATH", "HOME", "USER"}.issubset(inherited))
+        server = configuration["mcpServers"]["agent-harness"]
+        self.assertEqual(["-X", "utf8", "./scripts/mcp_server.py"], server["args"])
+        inherited = server["env_vars"]
+        self.assertTrue({"PATH", "HOME", "USER", "SystemRoot"}.issubset(inherited))
 
     def test_initialize_and_tool_listing(self) -> None:
         server = McpServer(HarnessService({}))
