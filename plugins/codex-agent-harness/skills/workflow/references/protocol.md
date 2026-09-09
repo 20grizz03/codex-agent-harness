@@ -6,11 +6,13 @@ Use this protocol for one repository-changing task. The MCP server persists evid
 
 Read applicable `AGENTS.md`, `CLAUDE.md`, project scripts, and repository guidance. Inspect Git status and configuration that may cause data egress before running project commands. Isolate unrelated dirty work in another worktree. For an authorized reversible non-semantic overlap with clear intent, preserve a recoverable copy and merge safely. Stop with `needs_human` only when divergent intent or ownership cannot be determined.
 
-Call `check_runtime`; it must not invoke a model. Failed Claude readiness does not block writing, but a standard run cannot complete without its independent-review gate.
+Choose the route before calling runtime tools. For a standard run, call `check_runtime`; it must not invoke a model. Failed Claude readiness does not block writing, but a standard run cannot complete without its independent-review gate.
 
 ## 2. Choose the proportionate path
 
 Before `create_run`, classify the change by behavior and risk. OpenSpec is mandatory for the complex boundaries below. For example, one Jira issue that runs Google, Facebook, and Yandex independently with retries and partial success still needs an approved one-task campaign.
+
+In an active publication context, a narrow low-risk follow-up to an already verified candidate may use [Мелкие доработки](../../delivery-writing/references/publication-context.md#мелкие-доработки), including code changes. Follow that route before the standard cycle below: do not create a run or require tests, manual smoke, or independent review just for the follow-up. Preserve the verified baseline and explicitly label the new delta unverified. This exception does not complete an unfinished run or bypass its findings, required checks, or correction budget.
 
 The concise direct path is available only when inspection makes all of these clear: the edit is low risk, small, non-executable, does not change product behavior or a maintained contract, and needs no architectural choice. Typographical fixes and stale prose can qualify. Code, tests, configuration, security policy, `AGENTS.md`, skill instructions, generated artifacts, and behavioral documentation do not qualify merely because their diff is small. State the edit, preserve unrelated changes, run every repository-mandated check that applies, inspect the final diff, and report that no durable run evidence was created.
 
@@ -76,6 +78,6 @@ After a complete run, establish the structured `publication_context` described i
 
 Keep the package and any transfer limited to verified structured data. Do not include the full conversation, raw diff, command output, logs, model report, or tool transcript.
 
-Load `delivery-writing`, call `get_run` for every candidate and `get_campaign` when present, then verify each full Git result against its own frozen base. Every candidate must have complete state, matching paths and fingerprint, green current checks, and a resolved current review. Any mismatch stops the whole package. Perform the local manual scenario, refresh external state, and show one package with the implementation summary, categorized size, manual check, commit, PR text, Jira testing recommendations, and exact proposed actions.
+Load `delivery-writing`, call `get_run` for every candidate and `get_campaign` when present, then verify each full Git result against its own frozen base. Standard candidates must have complete state, matching paths and fingerprint, green current checks, and a resolved current review. An explicitly recorded small publication follow-up instead preserves this evidence for its baseline and labels its delta unverified under the publication reference; unexplained mismatches still stop the package. Perform the local manual scenario unless the follow-up route applies, refresh external state, and show one package with the implementation summary, categorized size, verification limitations, commit, PR text, Jira testing recommendations, and exact proposed actions.
 
 An unambiguous user instruction authorizes only the named subset of that shown package. It need not use a magic phrase. Refresh state before writing; if the candidate or action set changed, show the new package. Retry an already authorized action after a transient failure without asking again while its candidate, target, and scope remain unchanged. Merge, status changes, deployment, migration, force-push, and unlisted comments require their own explicit authorization.

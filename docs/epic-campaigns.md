@@ -55,6 +55,8 @@ The current user-visible task is the default publication context. An independent
 
 After local manual verification, the task shows the implementation summary, commit, PR text, Jira testing recommendations, and exact external actions. An unambiguous user instruction authorizes only the named subset. The authorization persists for an unchanged reversible action and its retry after a transient failure. Merge, Jira status, deployment, migration, force-push, and unlisted comments require explicit authority.
 
+For a narrow low-risk follow-up in an active publication task, the [small publication fix route](../plugins/codex-agent-harness/skills/delivery-writing/references/publication-context.md#мелкие-доработки) replaces automatic tests, manual smoke, and independent review with explicit unverified-delta reporting. Baseline evidence remains immutable and is not attributed to the new code; only the recorded follow-up explains the fingerprint difference. The updated package needs publication approval. This route cannot satisfy campaign completion, integration, next-wave prerequisites, or replay sealing.
+
 ## Closed-epic replay
 
 A replay curator reconstructs only the cutoff input. Executors cannot read final statuses, late comments, testing recommendations, linked PRs or commits, or historical diffs before `seal_campaign_candidate`. A fresh evaluator then scores contract fidelity and historical similarity, attributes gaps, and reports candidate readiness. The same prepared-task contracts, waves, checks, review history, cooldown, and recovery rules apply without weakening the historical repository's required checks.

@@ -7,7 +7,7 @@ description: Run repository-changing implementation through a durable Codex-led 
 
 Codex remains the user-facing lead and default writer. Apply repository-specific coding or review instructions when they match the task.
 
-Before creating a run, classify the change as a concise low-risk edit, a standard direct run, or an OpenSpec campaign. A single Jira issue can still require OpenSpec when it changes concurrency, retries, partial-failure behavior, consistency, security, compatibility, or several external integrations. File count and diff size do not decide the route.
+Before creating a run, classify the change as a concise low-risk edit, a small publication follow-up, a standard direct run, or an OpenSpec campaign. In an active publication context, first consider the [small follow-up route](../delivery-writing/references/publication-context.md#мелкие-доработки): it permits bounded code fixes without a new run, mandatory tests, or independent review, and explicitly records unverified changes. A single Jira issue can still require OpenSpec when it changes concurrency, retries, partial-failure behavior, consistency, security, compatibility, or several external integrations. File count and diff size do not decide the route.
 
 When an `epic-workflow` campaign is active, this skill owns exactly one implementation task. Return its terminal `run_id` to the campaign instead of expanding into sibling tasks.
 

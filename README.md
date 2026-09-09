@@ -12,6 +12,8 @@ Technical design must be sufficiently resolved before implementation tasks are p
 
 An obvious low-risk edit to non-executable text may use a concise direct path without a campaign or durable run. Instruction, `AGENTS.md`, configuration, security, and behavior changes are not eligible merely because their diff is small. Repository-mandated checks still run. Once the user approves a concrete plan, reversible local work proceeds without repeated confirmations; external and irreversible actions remain separately authorized.
 
+An active publication task may also apply a [small follow-up](plugins/codex-agent-harness/skills/delivery-writing/references/publication-context.md#мелкие-доработки) to an already verified candidate, including a narrow low-risk code fix, without a new run or automatic tests, manual smoke, or independent review. It preserves the verified baseline, records the entire follow-up delta as unverified, and shows a new publication package for approval. This does not complete an unfinished run, override explicit repository checks, or provide a verified dependency for another campaign wave. Broader or risk-sensitive fixes return to the standard workflow.
+
 ## Skills
 
 - `workflow` runs repository mutations through the durable Codex-led cycle.
