@@ -40,6 +40,7 @@ from .policy import (
     validate_risk,
 )
 from .review import build_stage_prompt, validate_review
+from .verification import closeout_paths, correction_context, optional_snapshot
 from .store import RunStore, SCHEMA_VERSION
 from .util import (
     InputError,
@@ -127,14 +128,38 @@ class HarnessService:
         )
 
     @staticmethod
+    def _public_stage(stage: Mapping[str, Any]) -> dict[str, Any]:
+        return {key: value for key, value in stage.items() if key != "snapshot"}
+
+    @staticmethod
     def _public_state(
         contract: dict[str, Any],
         state: dict[str, Any],
         review: dict[str, Any],
     ) -> dict[str, Any]:
+        public_state = dict(state)
+        # Полные хеши нужны серверу, но повторять их в контексте ведущего незачем.
+        for key in ("planned_snapshot", "review_snapshot"):
+            snapshot = public_state.pop(key, None)
+            if isinstance(snapshot, dict):
+                public_state[f"{key}_summary"] = {
+                    "head_sha": snapshot.get("head_sha"),
+                    "clean": snapshot.get("clean"),
+                    "file_count": len(snapshot.get("files", {})),
+                }
+        public_state["stages"] = {
+            key: HarnessService._public_stage(stage)
+            for key, stage in state.get("stages", {}).items()
+        }
+        scope = public_state.get("correction_review")
+        if isinstance(scope, dict):
+            public_state["correction_review"] = {
+                key: value for key, value in scope.items()
+                if not key.startswith("previous_")
+            }
         return {
             "contract": contract,
-            "state": state,
+            "state": public_state,
             "review": review,
         }
 
@@ -927,6 +952,9 @@ class HarnessService:
         fingerprint = run_state.get("diff_fingerprint")
         if not isinstance(fingerprint, str):
             raise StateError("completed v1 run is missing its diff fingerprint")
+        actual_fingerprint, _ = diff_fingerprint(run_store.context, base_sha=actual_base)
+        if actual_fingerprint != fingerprint:
+            raise StateError("completed candidate changed after verification")
         head_sha = run_store.context.head_sha
         is_predecessor = any(
             isinstance(task, Mapping)
@@ -1258,7 +1286,9 @@ class HarnessService:
     def _integration_gaps(
         contract: Mapping[str, Any], state: Mapping[str, Any]
     ) -> list[str]:
-        if contract.get("integration_policy") != "combined-review-required":
+        if contract.get("integration_policy") not in {
+            "combined-review-required", "combined-review-when-needed"
+        }:
             return []
         definitions = [
             task
@@ -1291,6 +1321,12 @@ class HarnessService:
                     for task in repository_features
                     if int(task.get("wave", 1)) == wave
                 ]
+                if (
+                    len(features) == 1
+                    and contract.get("integration_policy") == "combined-review-when-needed"
+                ):
+                    # Единственный кандидат передаётся напрямую, без нового слияния.
+                    continue
                 feature_ids = {str(task.get("id")) for task in features}
                 integrations = [
                     task
@@ -1686,6 +1722,9 @@ class HarnessService:
         store = RunStore.for_workspace(self._workspace(arguments))
         run_id = self._run_id(arguments)
         begin_correction = arguments.get("begin_correction", False)
+        closeout = arguments.get("nonsemantic_closeout", False)
+        if not isinstance(closeout, bool):
+            raise InputError("nonsemantic_closeout must be a boolean")
         if not isinstance(begin_correction, bool):
             raise InputError("begin_correction must be a boolean")
         with self._lock:
@@ -1709,18 +1748,34 @@ class HarnessService:
                     "review_budget": effective_review_budget(contract),
                     "budget_status": state.get("budget_status"),
                     "risk": state.get("risk"),
+                    "review_reuse": state.get("review_closeout"),
                     "checks": state.get("planned_checks", []),
                     "deduplicated": True,
                 }
 
+            snapshot = optional_snapshot(store.context)
+            review_file = store.read_review(run_id)
+            closeout_record = None
+            if closeout:
+                if snapshot is None:
+                    raise StateError("nonsemantic closeout requires a supported snapshot")
+                edited = closeout_paths(
+                    state.get("review_snapshot"), snapshot, review_file, contract
+                )
+                closeout_record = {
+                    "source_fingerprint": review_file["review"]["diff_fingerprint"],
+                    "diff_fingerprint": fingerprint,
+                    "changed_paths": edited,
+                    "kind": "nonsemantic_closeout",
+                }
             phase = state.get("phase")
             review_summary = state.get("review_summary") or {}
             reviewed_previous = (
                 isinstance(review_summary, Mapping)
                 and review_summary.get("diff_fingerprint") == previous
             )
-            if phase == "reviewing" or (
-                phase == "checking" and reviewed_previous
+            if not closeout and (
+                phase == "reviewing" or (phase == "checking" and reviewed_previous)
             ):
                 if not begin_correction:
                     raise StateError(
@@ -1745,7 +1800,7 @@ class HarnessService:
                     )
                 self._transition(state, "correcting")
                 phase = "correcting"
-            if phase == "correcting":
+            if phase == "correcting" and not closeout:
                 review_summary = state.get("review_summary") or {}
                 reviewed_fingerprint = review_summary.get("diff_fingerprint")
                 if reviewed_fingerprint == fingerprint:
@@ -1776,6 +1831,11 @@ class HarnessService:
                 changed_paths=paths,
             )
             state["diff_fingerprint"] = fingerprint
+            state["planned_snapshot"] = snapshot
+            state["review_closeout"] = closeout_record
+            state["correction_review"] = correction_context(
+                store.context, state.get("review_snapshot"), snapshot, review_file
+            )
             state["changed_paths"] = paths
             state["diff_stats"] = statistics
             state["budget_status"] = budget_status
@@ -1807,6 +1867,7 @@ class HarnessService:
             "review_budget": effective_review_budget(contract),
             "budget_status": budget_status,
             "risk": risk,
+            "review_reuse": closeout_record,
             "checks": checks,
             "deduplicated": False,
         }
@@ -2123,6 +2184,8 @@ class HarnessService:
                     )
                     store.save_review(run_id, review_file)
                     state["review_cycle"] = cycle
+                    state["review_snapshot"] = stage.get("snapshot")
+                    state["review_closeout"] = None
                     state["review_summary"] = {
                         "origin": "claude",
                         "verdict": review["verdict"],
@@ -2234,7 +2297,7 @@ class HarnessService:
                         "stage_id": existing_id,
                         "profile": profile,
                         "status": existing_retry.get("lifecycle_state"),
-                        "terminal": existing_retry,
+                        "terminal": self._public_stage(existing_retry),
                         "deduplicated": True,
                     }
             if profile == "critic":
@@ -2312,7 +2375,7 @@ class HarnessService:
                         "stage_id": existing_id,
                         "profile": profile,
                         "status": same_diff.get("lifecycle_state"),
-                        "terminal": same_diff,
+                        "terminal": self._public_stage(same_diff),
                         "deduplicated": True,
                     }
 
@@ -2333,7 +2396,7 @@ class HarnessService:
                     "stage_id": stage_id,
                     "profile": profile,
                     "status": existing.get("lifecycle_state"),
-                    "terminal": existing,
+                    "terminal": self._public_stage(existing),
                     "deduplicated": True,
                 }
 
@@ -2391,11 +2454,12 @@ class HarnessService:
                     "profile": profile,
                     "status": "failed",
                     "claude_invoked": False,
-                    "terminal": stage_record,
+                    "terminal": self._public_stage(stage_record),
                     "deduplicated": False,
                 }
             command = claude_runtime.build_command(
-                str(claude_info["path"]), profile=profile, model=model
+                str(claude_info["path"]), profile=profile, model=model,
+                cwd=store.context.repo_root,
             )
             prompt = build_stage_prompt(profile=profile, contract=contract, state=state)
             stage_record = {
@@ -2409,6 +2473,7 @@ class HarnessService:
                 "runtime_version": contract.get("runtime_version", "unknown"),
                 "campaign_probe": limit_action == "probe",
                 "review_cycle": int(state.get("review_cycle", 0)) + 1,
+                "snapshot": state.get("planned_snapshot") if profile == "critic" else None,
             }
             if retry_stage_id is not None:
                 stage_record["retry_of"] = retry_stage_id
@@ -2502,7 +2567,7 @@ class HarnessService:
                     "profile": stage.get("profile"),
                     "status": "terminal",
                     "updates": [],
-                    "terminal": stage,
+                    "terminal": self._public_stage(stage),
                 }
         return active.poll(float(wait_seconds))
 
@@ -2526,7 +2591,7 @@ class HarnessService:
                     "run_id": run_id,
                     "stage_id": stage_id,
                     "status": "terminal",
-                    "terminal": stage,
+                    "terminal": self._public_stage(stage),
                     "deduplicated": True,
                 }
         return active.cancel()
@@ -2606,6 +2671,10 @@ class HarnessService:
             review_file = store.read_review(run_id)
             review = review_file.get("review")
             supplied_review = arguments.get("review")
+            closeout = state.get("review_closeout") or {}
+            review_fingerprint = closeout.get("source_fingerprint", state.get("diff_fingerprint"))
+            if closeout and supplied_review is not None:
+                raise StateError("closeout preserves the original review; do not replace it")
             if contract.get("writer") == "claude":
                 implement_stages = [
                     stage
@@ -2631,7 +2700,7 @@ class HarnessService:
                     state["review_cycle"] = cycle
                 elif not isinstance(review, dict) or review.get(
                     "diff_fingerprint"
-                ) != state.get("diff_fingerprint"):
+                ) != review_fingerprint:
                     raise InputError("Codex must supply an independent structured review")
             else:
                 fallback_allowed = self._codex_fallback_allowed(state)
@@ -2655,15 +2724,18 @@ class HarnessService:
                     )
                 elif not isinstance(review, dict) or review.get(
                     "diff_fingerprint"
-                ) != state.get("diff_fingerprint"):
+                ) != review_fingerprint:
                     if fallback_allowed:
                         raise StateError(
                             "a fresh Codex fallback review must be supplied"
                         )
                     raise StateError("Claude critic review is not complete")
 
-            if review.get("diff_fingerprint") != state.get("diff_fingerprint"):
+            if review.get("diff_fingerprint") != review_fingerprint:
                 raise StateError("review does not describe the current diff fingerprint")
+            if supplied_review is not None:
+                state["review_snapshot"] = state.get("planned_snapshot")
+                state["review_closeout"] = None
             finding_ids = {
                 finding["id"]
                 for finding in review.get("findings", [])
@@ -2749,6 +2821,21 @@ class HarnessService:
         )
         if current != state.get("diff_fingerprint"):
             blockers.append("current diff does not match the checked fingerprint")
+        reviewed_fingerprint = current
+        closeout = state.get("review_closeout")
+        if isinstance(closeout, dict):
+            snapshot = optional_snapshot(store.context)
+            try:
+                if not snapshot or closeout.get("diff_fingerprint") != current:
+                    raise StateError("closeout fingerprint is stale")
+                paths = closeout_paths(
+                    state.get("review_snapshot"), snapshot, review_file, contract
+                )
+                if paths != closeout.get("changed_paths"):
+                    raise StateError("closeout paths changed")
+                reviewed_fingerprint = closeout["source_fingerprint"]
+            except (StateError, KeyError) as exc:
+                blockers.append(str(exc))
         if "review_budget" in contract:
             budget_status = state.get("budget_status")
             if budget_status is None:
@@ -2767,7 +2854,7 @@ class HarnessService:
                     stage
                     for stage in state.get("stages", {}).values()
                     if isinstance(stage, dict) and stage.get("profile") == "critic"
-                    and stage.get("diff_fingerprint") == current
+                    and stage.get("diff_fingerprint") == reviewed_fingerprint
                 ]
                 if not any(
                     stage.get("lifecycle_state") == "completed" for stage in critic
@@ -2775,7 +2862,7 @@ class HarnessService:
                     blockers.append("Claude critic stage is not complete")
             elif origin == "codex_fallback":
                 if not self._codex_fallback_allowed(
-                    state, current_review_recorded=True
+                    {**state, "diff_fingerprint": reviewed_fingerprint}, current_review_recorded=True
                 ):
                     blockers.append(
                         "Codex fallback review lacks a confirmed Anthropic usage limit"
@@ -2784,7 +2871,7 @@ class HarnessService:
                 blockers.append("review origin is not allowed for a Codex writer")
         elif origin != "codex":
             blockers.append("review origin is not independent from the writer")
-        if review.get("diff_fingerprint") != current:
+        if review.get("diff_fingerprint") != reviewed_fingerprint:
             blockers.append("review does not describe the current diff")
         if review.get("blocking_question"):
             blockers.append("review has a blocking question")
@@ -2888,6 +2975,8 @@ class HarnessService:
                 "at": utc_now(),
                 "summary": summary or "All local implementation gates passed",
             }
+            if status == "complete" and state.get("review_closeout"):
+                state["terminal"]["verification_reuse"] = state["review_closeout"]
             if blocking_question:
                 state["terminal"]["blocking_question"] = blocking_question
             state = store.save_state(run_id, state)

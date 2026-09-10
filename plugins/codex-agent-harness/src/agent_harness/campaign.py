@@ -741,13 +741,30 @@ def build_campaign(
         base_from_task = task.get("base_from_task")
         predecessor = task_definitions.get(str(base_from_task))
         expected_wave = int(task["wave"]) - 1
+        preceding_features = [
+            candidate for candidate in tasks
+            if candidate.get("kind") == "implementation"
+            and candidate.get("role", "task") == "task"
+            and candidate.get("repository_key") == task.get("repository_key")
+            and int(candidate.get("wave", 1)) == expected_wave
+        ]
+        single_predecessor = (
+            len(preceding_features) == 1
+            and preceding_features[0].get("id") == base_from_task
+            and not any(
+                candidate.get("role") == "integration"
+                and candidate.get("repository_key") == task.get("repository_key")
+                and int(candidate.get("wave", 1)) == expected_wave
+                for candidate in tasks
+            )
+        )
         if (
             not isinstance(predecessor, dict)
-            or predecessor.get("role") != "integration"
+            or (predecessor.get("role") != "integration" and not single_predecessor)
             or int(predecessor.get("wave", 1)) != expected_wave
         ):
             raise InputError(
-                "each later wave must use base_from_task from the preceding integration wave"
+                "each later wave must use base_from_task from the preceding integration wave or its single source task"
             )
 
     implementation_count = sum(
@@ -850,7 +867,7 @@ def build_campaign(
         "cutoff_at": cutoff_at,
         "withheld_evidence": REPLAY_WITHHELD_EVIDENCE if mode == "replay" else [],
         "tasks": tasks,
-        "integration_policy": "combined-review-required",
+        "integration_policy": "combined-review-when-needed",
         "interaction_policy": (
             "задавать вопросы только при блокирующем продуктовом выборе "
             "или внешнем изменении"

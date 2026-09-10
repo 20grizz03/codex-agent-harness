@@ -15,6 +15,8 @@ Before changing files, read [references/protocol.md](references/protocol.md) com
 
 Prepared campaign tasks default to native `gpt-5.6-sol` execution at `high` reasoning effort. The campaign lead passes both stored values explicitly when spawning the executor; the MCP server records this planning contract but does not attest which native model ran. Claude may use `implement` only when the user explicitly requests it. Otherwise Claude is the fresh read-only critic.
 
+For an already reviewed candidate, read [review follow-ups](references/review-followups.md) before choosing another full cycle. It defines scoped correction review and a server-validated nonsemantic P3 closeout that retains the original review provenance while rerunning mandatory checks.
+
 Once the user approves a concrete plan, continue its reversible local edits, checks, corrections, authorized commits, and unchanged retries without asking again across turns. Resolve a reversible non-semantic overlap when intent is clear and the user authorized it. Ask only when product behavior or scope changes, user-owned intent cannot be determined safely, or an external or irreversible action has not already been authorized.
 
 After `finish_run(status: complete)`, use `delivery-writing` in the current user-visible task and verify every candidate before showing a publication package. A campaign executor returns its terminal `run_id` and short summary to the campaign lead. Create a separate fresh task only when the user explicitly selected that boundary; publication itself never requires it. Stale checks, stale review, or unresolved findings remain in implementation.

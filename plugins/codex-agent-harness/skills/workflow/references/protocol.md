@@ -42,7 +42,7 @@ Use `measure_diff` at useful slice boundaries. An `over_soft_limit` result promp
 
 The egress audit restricts command execution, not approved local editing. Isolate unsafe project commands where possible; if a mandatory check cannot run safely, report the blocker. Any edit invalidates old checks for the previous fingerprint.
 
-For a campaign dependency, create or update the approved atomic implementation commit before final checks so the integration task can verify it. A later wave begins only from the completed integration commit of its prerequisite wave.
+For a campaign dependency, create or update the approved atomic implementation commit before final checks. A later wave begins from its completed predecessor: an integration commit for several combined slices, or the sole source task's exact verified SHA for a single-slice wave. Do not create a merge and a duplicate run for an identical tree. Existing campaign contracts remain unchanged.
 
 ## 5. Independent review and recovery
 
@@ -64,9 +64,9 @@ Choose the review verdict after classifying findings. `pass` requires no actiona
 
 ## 6. Bounded correction and completion
 
-For each correction cycle, record accepted findings unresolved, fix them as one bounded pass, call `plan_checks(begin_correction: true)`, and rerun every required check. The changed fingerprint then requires a new independent review. Keep prior reviews and resolutions in history. Several edits before the next check/review boundary count as one correction cycle. Stop when immutable `max_correction_passes` is exhausted.
+Before another cycle, read [review follow-ups](review-followups.md). For code corrections, record accepted findings unresolved, fix them as one bounded pass, call `plan_checks(begin_correction: true)`, and rerun every required check. The new independent review focuses on previous findings, the delta and affected relationships when a verified base is available. Keep history; several edits before the next check/review boundary count as one correction cycle. Stop when immutable `max_correction_passes` is exhausted. A validated `nonsemantic_closeout` does not call the model or consume a correction cycle, but requires current checks and resolved P3 findings.
 
-Call `finish_run(status: complete)` only for the current full-result fingerprint with passing checks, a current independent review, all findings resolved, and no blocker. Use `needs_human` for a product or scope decision or dirty-file ownership; use other terminal states for their literal operational conditions.
+Call `finish_run(status: complete)` only with passing current checks, a current independent review or server-validated `verification_reuse`, all findings resolved, and no blocker. Disclose any reuse rather than claiming a fresh review. Use `needs_human` for a product or scope decision or dirty-file ownership; use other terminal states for their literal operational conditions.
 
 ## 7. Prepare publication
 

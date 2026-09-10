@@ -293,6 +293,10 @@ the review covers the complete checked Git state.
 Do not edit files. Report only actionable correctness, security, reliability,
 or contract defects with concrete impact and evidence. Do not repeat a known
 failed check as a new finding. Put uncertain validation gaps in residual_risks.
+Use Bash only for read-only inspection. Do not run tests, builds, dependency
+commands, formatters, or other diagnostics that may update source, lockfiles,
+module metadata or Git. Codex owns execution checks; describe a missing check
+as a validation gap instead of attempting to bypass the read-only sandbox.
 The review budget is advisory: size alone is not a defect and must not become a
 finding. Review the functional contract and note mixed independent behavior only
 when it creates a concrete correctness, testing, rollout, or rollback risk.
@@ -372,6 +376,7 @@ def build_stage_prompt(
                 for name, result in sorted(check_results.items())
             ],
             "review_focus": review_focus,
+            "review_scope": state.get("correction_review", {"mode": "full"}),
         },
     }
     instruction = (
@@ -379,6 +384,16 @@ def build_stage_prompt(
         if profile == "critic"
         else "Implement the immutable task contract in this repository."
     )
+    if profile == "critic" and (state.get("correction_review") or {}).get("mode") == "correction":
+        instruction = (
+            "Review the correction, not an unrelated new audit. Read Git against "
+            "review_scope.reviewed_head_sha, verify previous findings and decisions, "
+            "then inspect the delta and affected callers, invariants and tests. "
+            "Use the full immutable contract as the boundary. Expand review only "
+            "when the implementation materially changed or new evidence warrants it; "
+            "state the reason in residual_risks. Do not repeat rejected findings "
+            "without new contrary evidence."
+        )
     return (
         f"{instruction}\n\n"
         "The packet contains identifiers and evidence, not the Git diff. Read Git directly.\n"

@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
+from .git_repo import resolve_repo
 from .review import (
     CRITIC_SYSTEM_PROMPT,
     IMPLEMENT_JSON_SCHEMA,
@@ -43,6 +44,7 @@ REQUIRED_FLAGS = (
     "--verbose",
     "--permission-mode",
     "--settings",
+    "--setting-sources",
     "--strict-mcp-config",
     "--mcp-config",
     "--no-chrome",
@@ -311,19 +313,43 @@ def build_command(
     *,
     profile: str,
     model: str,
+    cwd: str | Path | None = None,
 ) -> list[str]:
     if profile == "critic":
+        if cwd is None:
+            raise InputError("critic profile requires a Git workspace")
+        context = resolve_repo(cwd)
         permission_mode = "plan"
         tools = "Read,Glob,Grep,Bash"
         denied = "Edit,Write,NotebookEdit"
         schema = REVIEW_JSON_SCHEMA
         system_prompt = CRITIC_SYSTEM_PROMPT
+        sandbox_settings = {
+            **SANDBOX_SETTINGS,
+            "sandbox": {
+                **SANDBOX_SETTINGS["sandbox"],
+                "excludedCommands": [],
+                "filesystem": {
+                    "denyWrite": list(
+                        dict.fromkeys(
+                            str(path)
+                            for path in (
+                                context.repo_root,
+                                context.git_dir,
+                                context.git_common_dir,
+                            )
+                        )
+                    )
+                },
+            },
+        }
     elif profile == "implement":
         permission_mode = "auto"
         tools = "Read,Glob,Grep,Edit,Write,Bash"
         denied = ""
         schema = IMPLEMENT_JSON_SCHEMA
         system_prompt = IMPLEMENT_SYSTEM_PROMPT
+        sandbox_settings = SANDBOX_SETTINGS
     else:
         raise InputError("profile must be critic or implement")
     command = [
@@ -338,7 +364,7 @@ def build_command(
         "--tools",
         tools,
         "--settings",
-        json.dumps(SANDBOX_SETTINGS, separators=(",", ":")),
+        json.dumps(sandbox_settings, separators=(",", ":")),
         "--output-format",
         "stream-json",
         "--verbose",
@@ -360,6 +386,8 @@ def build_command(
     ]
     if denied:
         command.extend(["--disallowedTools", denied])
+    if profile == "critic":
+        command.extend(["--setting-sources", ""])
     return command
 
 

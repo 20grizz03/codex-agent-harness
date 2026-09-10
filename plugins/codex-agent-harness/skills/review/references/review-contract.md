@@ -4,6 +4,8 @@ The critic receives the immutable task contract, base SHA, current full-result f
 
 The `critic` profile is read-only: Claude runs with safe mode, plan permissions, no session persistence, no Chrome, no dynamic system-prompt sections, an empty strict MCP configuration, and only `Read`, `Glob`, `Grep`, and `Bash`. `Edit`, `Write`, and `NotebookEdit` are explicitly denied. Bash is limited to read-only repository inspection; project checks remain the Codex lead's responsibility.
 
+The command disables user/project/local settings with `--setting-sources ''` and sets sandbox `filesystem.denyWrite` for the absolute repository root, worktree Git directory and common Git directory. Unsandboxed commands and command exclusions are disabled. Missing workspace or CLI capability fails closed. Administrator-managed policy remains an environment boundary; a fake-process test confirms command configuration, not actual OS enforcement. Never bypass a sandbox denial to run a diagnostic.
+
 Classify findings before choosing the verdict. The structured result contains:
 
 - `verdict`: `pass`, `changes_requested`, or `blocked`;
@@ -19,4 +21,4 @@ Codex independently traces each finding through surrounding production code and 
 
 One explicit retry may create a new critic stage only after `transient_timeout` or `transient_process_failure` and only within the immutable one-retry budget. It names the failed stage and is idempotent. The only degraded reviewer is a fresh read-only native Codex subagent after `failure_kind: anthropic_limit`; it follows this contract and is stored with origin `codex_fallback`. Never reinterpret another provider error as a limit.
 
-Any correction changes the fingerprint. Its checks and independent review must run again as a new cycle; prior structured results stay in history but do not complete the corrected result.
+Code corrections change the fingerprint and require current checks and a fresh review. Use `review_scope`: with an accessible clean reviewed SHA, verify previous findings, the delta and affected relationships instead of restarting an unrelated audit. Expand scope for a materially changed implementation or new evidence, explaining the reason; do not repeat a rejected finding without new contrary evidence. Missing or uncommitted bases use full review. Before model invocation, the lead may instead choose the narrowly validated [nonsemantic P3 closeout](../../workflow/references/review-followups.md); it preserves original review provenance and never certifies new code.

@@ -1,6 +1,6 @@
 {
   "name": "codex-agent-harness",
-  "version": "0.2.1+codex.20260909080200",
+  "version": "0.2.1+codex.20260910075246",
   "description": "Run repository tasks and epic campaigns through durable checks, independent Claude review, and controlled Jira and GitHub Enterprise delivery while Codex remains the lead.",
   "author": {
     "name": "Andrei Semeniuk"

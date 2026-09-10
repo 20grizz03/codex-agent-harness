@@ -754,6 +754,7 @@ TOOLS: list[dict[str, Any]] = [
                 "workspace": WORKSPACE,
                 "run_id": RUN_ID,
                 "begin_correction": {"type": "boolean"},
+                "nonsemantic_closeout": {"type": "boolean", "description": "Explicit P3 editorial/indirect-only closeout: rerun checks and retain original review provenance; not a code-review bypass."},
             },
             "additionalProperties": False,
         },

@@ -212,6 +212,7 @@ if args == ["--help"]:
         "--include-partial-messages", "--verbose", "--permission-mode",
         "--settings", "--strict-mcp-config", "--mcp-config", "--no-chrome",
         "--disable-slash-commands", "--json-schema", "--disallowedTools",
+        "--setting-sources",
     ]
     missing = os.environ.get("FAKE_CLAUDE_MISSING_FLAG", "")
     print(" ".join(flag for flag in flags if flag != missing))

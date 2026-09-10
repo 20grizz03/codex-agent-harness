@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,11 +9,25 @@ import _support
 
 from agent_harness.claude_runtime import (
     ManagedStage,
+    SANDBOX_SETTINGS,
     build_command,
     check_runtime,
 )
 from agent_harness.service import HarnessService
-from agent_harness.util import StateError
+from agent_harness.util import InputError, StateError
+
+
+def _initialize_git_repository(root: Path) -> None:
+    _support.git(root, "init", "-b", "main")
+    _support.git(root, "config", "user.name", "Agent Harness Tests")
+    _support.git(root, "config", "user.email", "tests@example.invalid")
+    (root / "README.md").write_text("initial\n", encoding="utf-8")
+    _support.git(root, "add", "README.md")
+    _support.git(root, "commit", "-m", "initial")
+
+
+def _command_settings(command: list[str]) -> dict:
+    return json.loads(command[command.index("--settings") + 1])
 
 
 class ReadinessTests(unittest.TestCase):
@@ -106,9 +121,13 @@ class ReadinessTests(unittest.TestCase):
 
 class CommandTests(unittest.TestCase):
     def test_critic_command_is_read_only_and_has_no_fallback(self) -> None:
-        command = build_command(
-            "/fake/claude", profile="critic", model="claude-opus-5"
-        )
+        with _support.TempRepo() as repo:
+            command = build_command(
+                "/fake/claude",
+                profile="critic",
+                model="claude-opus-5",
+                cwd=repo.path,
+            )
         joined = " ".join(command)
         self.assertIn("--permission-mode plan", joined)
         self.assertIn("--tools Read,Glob,Grep,Bash", joined)
@@ -116,7 +135,59 @@ class CommandTests(unittest.TestCase):
         self.assertIn("--safe-mode", command)
         self.assertIn("--no-session-persistence", command)
         self.assertIn("--strict-mcp-config", command)
+        self.assertEqual("", command[command.index("--setting-sources") + 1])
         self.assertNotIn("--fallback-model", command)
+
+    def test_critic_command_denies_repository_and_git_metadata_writes(self) -> None:
+        with _support.TempRepo() as repo:
+            command = build_command(
+                "/fake/claude",
+                profile="critic",
+                model="claude-opus-5",
+                cwd=repo.path,
+            )
+
+            settings = _command_settings(command)
+            self.assertFalse(settings["sandbox"]["allowUnsandboxedCommands"])
+            self.assertEqual([], settings["sandbox"]["excludedCommands"])
+            self.assertEqual(
+                [str(repo.path.resolve()), str((repo.path / ".git").resolve())],
+                settings["sandbox"]["filesystem"]["denyWrite"],
+            )
+
+    def test_critic_command_denies_linked_worktree_git_metadata_writes(self) -> None:
+        with _support.TempRepo() as repo, tempfile.TemporaryDirectory() as directory:
+            worktree = Path(directory) / "review-worktree"
+            _support.git(repo.path, "worktree", "add", "--detach", str(worktree))
+            git_dir = Path(
+                _support.git(worktree, "rev-parse", "--absolute-git-dir")
+            ).resolve()
+            git_common_dir = Path(
+                _support.git(
+                    worktree,
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--git-common-dir",
+                )
+            ).resolve()
+
+            command = build_command(
+                "/fake/claude",
+                profile="critic",
+                model="claude-opus-5",
+                cwd=worktree,
+            )
+
+            self.assertEqual(
+                [str(worktree.resolve()), str(git_dir), str(git_common_dir)],
+                _command_settings(command)["sandbox"]["filesystem"]["denyWrite"],
+            )
+
+    def test_critic_command_fails_closed_without_git_workspace(self) -> None:
+        with self.assertRaisesRegex(InputError, "requires a Git workspace"):
+            build_command(
+                "/fake/claude", profile="critic", model="claude-opus-5"
+            )
 
     def test_implement_command_is_distinct(self) -> None:
         command = build_command(
@@ -126,6 +197,7 @@ class CommandTests(unittest.TestCase):
         self.assertIn("--permission-mode auto", joined)
         self.assertIn("Edit,Write", joined)
         self.assertNotIn("--disallowedTools", command)
+        self.assertEqual(SANDBOX_SETTINGS, _command_settings(command))
 
 
 class ManagedStageTests(unittest.TestCase):
@@ -137,6 +209,7 @@ class ManagedStageTests(unittest.TestCase):
         model: str = "claude-opus-5",
         timeout: int = 30,
     ) -> tuple[ManagedStage, list[dict], list[dict]]:
+        _initialize_git_repository(root)
         fake = _support.make_fake_claude(root)
         environ = _support.fake_environment(
             fake,
@@ -150,7 +223,9 @@ class ManagedStageTests(unittest.TestCase):
             stage_id="run-test:critic:1",
             run_id="run-test",
             profile="critic",
-            command=build_command(str(fake), profile="critic", model="claude-opus-5"),
+            command=build_command(
+                str(fake), profile="critic", model="claude-opus-5", cwd=root
+            ),
             cwd=root,
             prompt="review the repository",
             environ=environ,
@@ -182,6 +257,7 @@ class ManagedStageTests(unittest.TestCase):
     def test_contradictory_review_is_normalized_with_allowlisted_telemetry(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            _initialize_git_repository(root)
             source = _support.finding_review()
             source["verdict"] = "pass"
             fake = _support.make_fake_claude(root)
@@ -191,7 +267,7 @@ class ManagedStageTests(unittest.TestCase):
                 run_id="run-test",
                 profile="critic",
                 command=build_command(
-                    str(fake), profile="critic", model="claude-opus-5"
+                    str(fake), profile="critic", model="claude-opus-5", cwd=root
                 ),
                 cwd=root,
                 prompt="review the repository",
@@ -223,6 +299,7 @@ class ManagedStageTests(unittest.TestCase):
     def test_blocking_question_normalization_has_priority(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            _initialize_git_repository(root)
             source = _support.finding_review()
             source["verdict"] = "pass"
             source["blocking_question"] = "Which contract is authoritative?"
@@ -233,7 +310,7 @@ class ManagedStageTests(unittest.TestCase):
                 run_id="run-test",
                 profile="critic",
                 command=build_command(
-                    str(fake), profile="critic", model="claude-opus-5"
+                    str(fake), profile="critic", model="claude-opus-5", cwd=root
                 ),
                 cwd=root,
                 prompt="review the repository",
@@ -259,6 +336,7 @@ class ManagedStageTests(unittest.TestCase):
     def test_malformed_review_remains_failed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            _initialize_git_repository(root)
             source = _support.finding_review()
             source["verdict"] = "pass"
             source["findings"][0]["severity"] = "P4"
@@ -269,7 +347,7 @@ class ManagedStageTests(unittest.TestCase):
                 run_id="run-test",
                 profile="critic",
                 command=build_command(
-                    str(fake), profile="critic", model="claude-opus-5"
+                    str(fake), profile="critic", model="claude-opus-5", cwd=root
                 ),
                 cwd=root,
                 prompt="review the repository",
@@ -346,6 +424,7 @@ class ManagedStageTests(unittest.TestCase):
     def test_terminal_remains_observable_when_callback_fails(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            _initialize_git_repository(root)
             fake = _support.make_fake_claude(root)
 
             def fail_to_persist(_terminal: dict) -> None:
@@ -356,7 +435,7 @@ class ManagedStageTests(unittest.TestCase):
                 run_id="run-test",
                 profile="critic",
                 command=build_command(
-                    str(fake), profile="critic", model="claude-opus-5"
+                    str(fake), profile="critic", model="claude-opus-5", cwd=root
                 ),
                 cwd=root,
                 prompt="review the repository",
