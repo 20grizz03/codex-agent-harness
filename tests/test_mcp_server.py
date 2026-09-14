@@ -13,6 +13,9 @@ from agent_harness.service import HarnessService
 
 EXPECTED_TOOLS = {
     "check_runtime",
+    "create_followup",
+    "get_followup",
+    "record_followup",
     "create_campaign",
     "get_campaign",
     "list_campaigns",

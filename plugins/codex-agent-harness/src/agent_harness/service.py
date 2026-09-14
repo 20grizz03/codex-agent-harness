@@ -26,6 +26,7 @@ from .campaign import (
 )
 from .claude_runtime import ManagedStage
 from .contract import build_contract
+from .followup import FollowupService
 from .git_repo import (
     diff_fingerprint,
     diff_stats,
@@ -676,13 +677,36 @@ class HarnessService:
         workspace = self._workspace(arguments)
         context = resolve_repo(workspace)
         normalized = dict(arguments)
+        followup = None
+        followup_context = None
+        if arguments.get("followup_ref") is not None:
+            if arguments.get("campaign") is not None:
+                raise InputError("followup runs preserve the old campaign; do not attach them to its completed task")
+            followup = self._followup_reference(arguments["followup_ref"], workspace)
+            followup_context = FollowupService(followup["workspace"]).run_context(followup, workspace)
+            baseline = followup_context.get("verified_baseline")
+            if baseline:
+                baseline_contract = RunStore.for_workspace(baseline["workspace"]).read_contract(baseline["run_id"])
+                if RISK_RANK[validate_risk(normalized.get("risk", "medium"))] < RISK_RANK[baseline_contract["risk"]]:
+                    normalized["risk"] = baseline_contract["risk"]
+                normalized["forbidden_actions"] = list(dict.fromkeys([
+                    *baseline_contract.get("forbidden_actions", []), *normalized.get("forbidden_actions", [])]))
+            supplied_base = arguments.get("base_sha")
+            if supplied_base is not None and supplied_base != followup["parent_sha"]:
+                raise InputError("run base_sha conflicts with the pinned followup parent")
+            normalized["base_sha"] = followup["parent_sha"]
         parent = self._prepare_campaign_run(normalized, context)
         contract, state = build_contract(normalized, context)
+        if followup is not None:
+            contract["followup_ref"] = followup
+            contract["followup_context"] = followup_context
         contract["runtime_version"] = _runtime_version()
         if parent is not None:
             contract["campaign"] = parent["reference"]
         store = RunStore(context)
         with self._lock:
+            if followup is not None:
+                self._guard_followup(contract)
             if parent is not None:
                 self._adopt_campaign_runtime(
                     parent["store"],
@@ -701,6 +725,27 @@ class HarnessService:
             state,
             store.read_review(contract["run_id"]),
         )
+
+    @staticmethod
+    def _followup_reference(reference: Any, workspace: str, *, allow_complete: bool = False) -> dict:
+        if not isinstance(reference, Mapping):
+            raise InputError("followup_ref must be an object")
+        journal_workspace = require_string(reference.get("workspace"), "followup_ref.workspace", maximum=4096)
+        return FollowupService(journal_workspace).run_reference(reference, workspace, allow_complete=allow_complete)
+
+    @classmethod
+    def _guard_followup(cls, contract: Mapping) -> None:
+        if contract.get("followup_ref") is not None:
+            cls._followup_reference(contract["followup_ref"], contract["workspace"], allow_complete=True)
+
+    def create_followup(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        return FollowupService(self._workspace(arguments)).create(arguments)
+
+    def get_followup(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        return FollowupService(self._workspace(arguments)).get(arguments.get("followup_id"))
+
+    def record_followup(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        return FollowupService(self._workspace(arguments)).record(arguments)
 
     def get_run(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
         store = RunStore.for_workspace(self._workspace(arguments))
@@ -1734,6 +1779,7 @@ class HarnessService:
             )
             self._require_open(state)
             measurement = self._measure_current_diff(store, contract)
+            self._guard_followup(contract)
             fingerprint = str(measurement["diff_fingerprint"])
             paths = list(measurement["changed_paths"])
             statistics = dict(measurement["diff_stats"])
@@ -1897,6 +1943,7 @@ class HarnessService:
             self._require_open(state)
             if state.get("phase") != "checking":
                 raise StateError("checks may be recorded only in the checking phase")
+            self._guard_followup(contract)
             current, _paths = diff_fingerprint(
                 store.context, base_sha=str(contract["base_sha"])
             )
@@ -2274,6 +2321,7 @@ class HarnessService:
             )
             self._require_open(state)
             stages = state.setdefault("stages", {})
+            self._guard_followup(contract)
             if retry_stage_id is not None:
                 existing_retry = next(
                     (
@@ -2658,6 +2706,7 @@ class HarnessService:
             actual_fingerprint, _paths = diff_fingerprint(
                 store.context, base_sha=str(contract["base_sha"])
             )
+            self._guard_followup(contract)
             if actual_fingerprint != state.get("diff_fingerprint"):
                 raise StateError(
                     "diff changed after checks were recorded; call plan_checks again"
@@ -2816,6 +2865,10 @@ class HarnessService:
         review_file: dict[str, Any],
     ) -> list[str]:
         blockers: list[str] = []
+        try:
+            self._guard_followup(contract)
+        except (StateError, InputError) as exc:
+            blockers.append(str(exc))
         current, _paths = diff_fingerprint(
             store.context, base_sha=str(contract["base_sha"])
         )
@@ -2928,6 +2981,8 @@ class HarnessService:
             )
             existing_terminal = state.get("terminal")
             if isinstance(existing_terminal, dict):
+                if status == "complete":
+                    self._guard_followup(contract)
                 if existing_terminal.get("status") == status:
                     return {
                         "run_id": run_id,

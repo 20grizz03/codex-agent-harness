@@ -7,6 +7,8 @@ description: Independently review a repository result with a fresh read-only Cla
 
 Codex owns the review target, final judgment, and user-facing report. Read [references/review-contract.md](references/review-contract.md) completely before invoking the critic.
 
+Before drafting the user-facing report or a colleague-facing comment, apply the writing mode of [delivery-writing](../delivery-writing/SKILL.md). Do not wait for approval or publication. Preserve the structured review schema, finding identifiers, severities and evidence; writing conventions do not alter the review verdict or its checks.
+
 Create a run if the review is not already part of an active workflow. Record applicable deterministic checks first. Prefer delegating the model lifecycle to one native tracking subagent. Its task must forbid starting any MCP server or process, including `scripts/mcp_server.py`, and require `lifecycle tools unavailable` without side effects when plugin lifecycle tools are absent. The Codex instance that owns the run then calls them through its already configured `agent-harness` MCP server; never start another MCP server or process for the same run. Claude must use the read-only `critic` profile and inspect the repository itself; Codex receives only sanitized progress and the structured result.
 
 If the persisted Claude stage reports `transient_timeout` or `transient_process_failure`, one explicit retry may name the failed stage only when the immutable run budget allows it. Repeating that request must not start another process. Do not retry cancellation, authentication, billing or safety failures, invalid output, or model-policy failures.

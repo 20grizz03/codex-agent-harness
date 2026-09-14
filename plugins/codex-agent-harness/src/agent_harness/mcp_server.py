@@ -9,6 +9,7 @@ from typing import Any, Callable, Mapping
 from . import __version__
 from .review import REVIEW_FIELD_DESCRIPTIONS
 from .service import HarnessService
+from .followup_schema import FOLLOWUP_REF_SCHEMA, FOLLOWUP_TOOLS
 from .util import HarnessError, InputError, require_string
 
 
@@ -307,6 +308,7 @@ def _annotations(title: str, *, read_only: bool, idempotent: bool) -> dict[str, 
 
 
 TOOLS: list[dict[str, Any]] = [
+    *FOLLOWUP_TOOLS,
     {
         "name": "check_runtime",
         "description": (
@@ -682,6 +684,7 @@ TOOLS: list[dict[str, Any]] = [
                     "maxLength": 64,
                 },
                 "campaign": CAMPAIGN_RUN_SCHEMA,
+                "followup_ref": FOLLOWUP_REF_SCHEMA,
                 "review_budget": REVIEW_BUDGET_SCHEMA,
             },
             "additionalProperties": False,
@@ -952,6 +955,9 @@ class McpServer:
             "record_campaign_comparison": self.service.record_campaign_comparison,
             "finish_campaign": self.service.finish_campaign,
             "create_run": self.service.create_run,
+            "create_followup": self.service.create_followup,
+            "get_followup": self.service.get_followup,
+            "record_followup": self.service.record_followup,
             "get_run": self.service.get_run,
             "list_runs": self.service.list_runs,
             "measure_diff": self.service.measure_diff,

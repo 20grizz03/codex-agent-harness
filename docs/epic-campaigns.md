@@ -31,6 +31,8 @@ The default local OpenSpec mode keeps `/openspec` ignored and snapshots the appr
 
 At most three implementation executors run at once. Every executor gets its stored model and effort, its own worktree, run, checks, review history, and atomic commit. Campaign state records task transitions and sanitized interventions; it never stores raw connector responses, model streams, credentials, or environment values.
 
+When a completed source candidate changes after dependent tasks have started, use the separate [correction-chain journal](correction-chains.md) to pin the new source and preserve each descendant's full own-commit range. It leaves original campaign runs unchanged and does not authorize external publication.
+
 ## Checks, review, and recovery
 
 The run fingerprint covers the full result from the frozen base: committed changes, index, working tree, and untracked files without mutating the index. Any change invalidates earlier checks and current review.

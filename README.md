@@ -14,12 +14,16 @@ An obvious low-risk edit to non-executable text may use a concise direct path wi
 
 An active publication task may also apply a [small follow-up](plugins/codex-agent-harness/skills/delivery-writing/references/publication-context.md#мелкие-доработки) to an already verified candidate, including a narrow low-risk code fix, without a new run or automatic tests, manual smoke, or independent review. It preserves the verified baseline, records the entire follow-up delta as unverified, and shows a new publication package for approval. This does not complete an unfinished run, override explicit repository checks, or provide a verified dependency for another campaign wave. Broader or risk-sensitive fixes return to the standard workflow.
 
+For a candidate with dependent PRs, the [correction chain](plugins/codex-agent-harness/skills/workflow/references/correction-chain.md) pins the old and new parent SHAs and each descendant's own commit range. One epic lead coordinates propagation. A mechanical adaptation builds each affected PR and runs affected tests on terminal candidates with the accumulated scope of their ancestors, without automatically repeating Claude review; a semantic change starts a new scoped run. Completed original runs remain unchanged, and publication stays tied to the exact current candidate and its evidence.
+
+The [correction-chain reference](docs/correction-chains.md) documents the journal tools, frozen inputs, transitions, and publication-readiness checks.
+
 ## Skills
 
 - `workflow` runs repository mutations through the durable Codex-led cycle.
 - `review` obtains and verifies an independent read-only review.
 - `setup` checks the Claude subscription runtime without model inference.
-- `delivery-writing` prepares Jira tasks, testing recommendations, PR descriptions, and review comments. Drafting alone never publishes them; the current user-visible task may execute only the verified, shown package and only after an explicit instruction naming the action.
+- `delivery-writing` applies writing conventions before the first human-facing draft: chat replies, plans, documentation, code comments, UI messages, errors and readable logs. It adds Jira, QA, PR and review formats only when relevant. Writing alone does not start delivery checks or authorize publication; package verification and explicit authorization still apply when publishing an implementation.
 - `epic-workflow` decomposes an epic into durable v1 runs and can perform a blind replay of a closed epic before comparing with historical Jira, PR, and Git evidence.
 
 ## Install on another computer

@@ -356,6 +356,8 @@ def build_stage_prompt(
                 "review_budget",
                 "review_budget_mode",
                 "campaign",
+                "followup_ref",
+                "followup_context",
                 "runtime_version",
             )
         },
@@ -393,6 +395,16 @@ def build_stage_prompt(
             "when the implementation materially changed or new evidence warrants it; "
             "state the reason in residual_risks. Do not repeat rejected findings "
             "without new contrary evidence."
+        )
+    elif profile == "critic" and contract.get("followup_ref"):
+        instruction = (
+            "Review this dependency adaptation and its affected behavior, not an unrelated new audit. "
+            "Read the pinned previous task range, preserved baseline workspace and parent commits "
+            "from followup_context directly. Distinguish accepted parent changes from this task's "
+            "correction, verify preservation of its complete own range including late fixes, and "
+            "check changed contracts, data and delivery guarantees against the new task contract. "
+            "The baseline review is historical context, not proof of the adapted candidate. "
+            "Expand the scope only when material changes or new evidence require it and explain why."
         )
     return (
         f"{instruction}\n\n"
