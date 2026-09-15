@@ -24,9 +24,13 @@ These components are required for a complete implementation run:
 
 Claude must use first-party subscription OAuth. `check_runtime` rejects API keys, custom Anthropic endpoints, Bedrock, Vertex, and Foundry routing and never invokes a model itself. Native Codex model selection is separate planning metadata; Agent Harness does not launch or attest the selected Codex model.
 
-## OpenSpec decomposition
+## Specification-backed decomposition
 
-[OpenSpec](https://github.com/Fission-AI/OpenSpec) is the required planning layer before implementing large ideas, high-risk or ambiguous changes, multi-task epics, and single tasks that change concurrency, retry or recovery, partial-failure semantics, consistency, security-sensitive data, compatibility, or multiple external integrations. Agent Harness continues to own execution state, checks, worktrees, and review. A narrow, unambiguous single task can use the direct workflow without OpenSpec.
+Large ideas, high-risk or ambiguous changes, multi-task epics, and behaviorally complex single tasks need an approved specification. The default native format uses only local Markdown: `.agent-harness/specs/<change-id>/spec.md` for the common contract and `tasks/<task-id>.md` for every campaign task. A standalone run may use only `spec.md`. Keep `/.agent-harness/specs/` in the target repository's local `.git/info/exclude`; Agent Harness freezes the approved files into private Git metadata. No Node.js, OpenSpec CLI, schema install, `openspec init`, or mandatory OpenSpec syntax is needed. The [native specification guide](../skills/epic-workflow/references/native-spec.md) covers preparation and approval. A narrow, unambiguous single task can use the direct workflow without a spec.
+
+### Explicit or legacy OpenSpec mode
+
+[OpenSpec](https://github.com/Fission-AI/OpenSpec) remains available when the user explicitly selects it or an existing campaign has `kind: openspec`. It is not a dependency of native specs and existing campaigns are not rewritten automatically.
 
 OpenSpec currently requires Node.js 20.19.0 or newer. Install the CLI separately:
 
@@ -42,7 +46,7 @@ cp -R plugins/codex-agent-harness/skills/epic-workflow/assets/openspec-schema/ag
 env OPENSPEC_TELEMETRY=0 openspec schema validate agent-harness
 ```
 
-By default, keep `/openspec` in the target project but add `/openspec/` to the repository's local `.git/info/exclude` before creating files. Agent Harness requires the directory to be ignored and snapshots the approved change in private Git metadata. This local mode does not require `openspec init`.
+For local OpenSpec mode, keep `/openspec` in the target project but add `/openspec/` to the repository's local `.git/info/exclude` before creating files. Agent Harness requires the directory to be ignored and snapshots the approved change in private Git metadata. This local mode does not require `openspec init`.
 
 Initialize a target repository only when its owners explicitly want versioned specs:
 
@@ -50,7 +54,7 @@ Initialize a target repository only when its owners explicitly want versioned sp
 env OPENSPEC_TELEMETRY=0 openspec init
 ```
 
-The setup audit never runs installation, schema copy, or `openspec init`. Repeat the copy command after a plugin update so existing user-level schema files receive new templates and instructions. Agent Harness disables OpenSpec telemetry in every command it invokes. The custom schema requires technical decomposition readiness, requirement-to-task-to-scenario coverage, pinned contract revisions and availability checks, concise Russian content, failure and recovery contracts, security/data, compatibility, one independently verifiable functionality per task, an advisory 300–700 production-line target, a capability preflight, and checked integration between parallel waves.
+The setup audit never runs installation, schema copy, or `openspec init`. Repeat the copy command after a plugin update when using this legacy mode so existing user-level schema files receive new templates and instructions. Agent Harness disables OpenSpec telemetry in every command it invokes. The custom OpenSpec schema retains its own headings and syntax; they do not apply to native Markdown. Both modes require technical readiness, requirement-to-task-to-scenario coverage, pinned contract revisions and availability checks, and an advisory 300–700 production-line target per implementation slice.
 
 ## Scenario integrations
 

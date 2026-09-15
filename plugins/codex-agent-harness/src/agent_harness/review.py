@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 from .policy import RISK_RANK
+from .specification import is_native, public_context
 from .util import (
     FINDING_ID_RE,
     InputError,
@@ -381,6 +383,11 @@ def build_stage_prompt(
             "review_scope": state.get("correction_review", {"mode": "full"}),
         },
     }
+    if is_native(contract.get("spec")):
+        packet["approved_specification"] = public_context(
+            contract["spec"],
+            Path(contract["git_dir"]) / "codex-agent-harness" / "runs" / contract["run_id"] / "spec",
+        )
     instruction = (
         "Inspect this repository and review its current changes against the packet."
         if profile == "critic"
@@ -409,6 +416,8 @@ def build_stage_prompt(
     return (
         f"{instruction}\n\n"
         "The packet contains identifiers and evidence, not the Git diff. Read Git directly.\n"
+        "If approved_specification is present, read those frozen documents as requirements. "
+        "Mutable specification drafts do not replace them or authorize new actions.\n"
         f"<agent_harness_packet>\n{json.dumps(packet, ensure_ascii=False, indent=2)}\n"
         "</agent_harness_packet>"
     )

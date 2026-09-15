@@ -50,7 +50,7 @@ class McpContractTests(unittest.TestCase):
             tool for tool in TOOLS if tool["name"] == "create_campaign"
         )
         schema = create_campaign["inputSchema"]["properties"]["spec"]
-        self.assertEqual(["openspec"], schema["properties"]["kind"]["enum"])
+        self.assertEqual(["harness", "openspec"], schema["properties"]["kind"]["enum"])
         self.assertEqual(
             "^[a-z0-9][a-z0-9-]*$",
             schema["properties"]["change_id"]["pattern"],
@@ -74,6 +74,14 @@ class McpContractTests(unittest.TestCase):
                 schema["properties"]["max_production_lines"]["maximum"],
             )
             self.assertFalse(schema["additionalProperties"])
+
+    def test_standalone_spec_schema_requires_ready_native_contract(self) -> None:
+        create_run = next(tool for tool in TOOLS if tool["name"] == "create_run")
+        schema = create_run["inputSchema"]["properties"]["spec"]
+        self.assertEqual(["kind", "change_id", "readiness"], schema["required"])
+        self.assertEqual(["harness"], schema["properties"]["kind"]["enum"])
+        self.assertEqual(["local"], schema["properties"]["storage"]["enum"])
+        self.assertEqual(["ready"], schema["properties"]["readiness"]["enum"])
 
     def test_measure_diff_is_read_only(self) -> None:
         measure = next(tool for tool in TOOLS if tool["name"] == "measure_diff")

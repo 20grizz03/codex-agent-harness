@@ -334,7 +334,7 @@ class CampaignTests(unittest.TestCase):
             self.assertEqual(0, run["contract"]["max_correction_passes"])
             self.assertEqual(0, run["contract"]["max_critic_retries"])
 
-    def test_complex_single_task_routes_to_openspec_before_run(self) -> None:
+    def test_complex_single_task_routes_to_approved_spec_before_run(self) -> None:
         workflow = (
             _support.PLUGIN_ROOT / "skills/workflow/references/protocol.md"
         ).read_text(encoding="utf-8")
@@ -344,11 +344,11 @@ class CampaignTests(unittest.TestCase):
 
         self.assertLess(
             workflow.index("Before `create_run`"),
-            workflow.index("OpenSpec is mandatory"),
+            workflow.index("An approved specification is required"),
         )
         self.assertIn("Google, Facebook, and Yandex", workflow)
         self.assertIn("one-task campaign", workflow)
-        self.assertIn("одну сложную задачу", epic)
+        self.assertIn("references/native-spec.md", epic)
 
     def test_reviewable_slice_guidance_uses_functionality_before_size(self) -> None:
         live_epic = (

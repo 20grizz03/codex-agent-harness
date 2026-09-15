@@ -20,6 +20,7 @@ from .contract import (
 from .git_repo import RepoContext, resolve_repo, run_git, status_snapshot
 from .policy import validate_checks, validate_risk
 from .store import RunStore, SCHEMA_VERSION
+from .specification import is_native, prepare_spec, verify_snapshot
 from .util import (
     InputError,
     StateError,
@@ -439,6 +440,9 @@ def verify_openspec_reference(
     reference = contract.get("spec")
     if reference is None:
         return
+    if is_native(reference):
+        verify_snapshot(reference, local_spec_dir)
+        return
     old_fields = {"kind", "change_id", "path", "sha256"}
     new_fields = {*old_fields, "storage"}
     if not isinstance(reference, Mapping) or frozenset(reference) not in {
@@ -704,12 +708,17 @@ def build_campaign(
         raise InputError("cutoff_at is only valid for replay campaigns")
     if mode == "replay" and arguments.get("spec") is not None:
         raise InputError("spec is only valid for delivery campaigns")
-    spec, spec_files = _openspec_reference(arguments.get("spec"), context)
     risk = validate_risk(arguments.get("risk", "high"))
 
     now = utc_now()
     campaign_id = new_campaign_id()
     tasks = _tasks(arguments.get("tasks"))
+    raw_spec = arguments.get("spec")
+    spec, spec_files = (
+        prepare_spec(raw_spec, context, [task["id"] for task in tasks])
+        if is_native(raw_spec)
+        else _openspec_reference(raw_spec, context)
+    )
     task_definitions: dict[str, dict[str, Any]] = {}
     for task in tasks:
         if task["kind"] != "implementation":
@@ -772,17 +781,22 @@ def build_campaign(
         for task in tasks
     )
     if spec is not None:
-        readiness_files = (
-            spec_files
-            if spec_files is not None
-            else _openspec_directory_files(context.repo_root / spec["path"])
-        )
-        readiness = _openspec_decomposition_readiness(readiness_files)
+        if is_native(spec):
+            readiness = spec["readiness"]
+            if any(task.get("role") == "finalizer" for task in tasks):
+                raise InputError("native specifications do not need an OpenSpec finalizer")
+        else:
+            readiness_files = (
+                spec_files
+                if spec_files is not None
+                else _openspec_directory_files(context.repo_root / spec["path"])
+            )
+            readiness = _openspec_decomposition_readiness(readiness_files)
         if readiness == "analysis_required" and any(
             task["kind"] != "analysis" for task in tasks
         ):
             raise InputError(
-                "OpenSpec analysis_required permits only analysis tasks"
+                "specification analysis_required permits only analysis tasks"
             )
     if mode == "delivery" and spec is None and (
         risk == "high"
@@ -790,7 +804,7 @@ def build_campaign(
         or any(task.get("role") == "finalizer" for task in tasks)
     ):
         raise InputError(
-            "an approved OpenSpec change is required for high-risk or multi-task "
+            "an approved specification (native harness or OpenSpec) is required for high-risk or multi-task "
             "delivery campaigns"
         )
 
@@ -1020,7 +1034,10 @@ class CampaignStore:
         return value
 
     def read_contract(self, campaign_id: str) -> dict[str, Any]:
-        return self._read(campaign_id, "contract.json")
+        contract = self._read(campaign_id, "contract.json")
+        if is_native(contract.get("spec")):
+            verify_snapshot(contract["spec"], self.spec_dir(campaign_id))
+        return contract
 
     def read_state(self, campaign_id: str) -> dict[str, Any]:
         return self._read(campaign_id, "state.json")

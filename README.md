@@ -2,7 +2,7 @@
 
 `codex-agent-harness` is a local Codex plugin for durable repository-changing tasks and multi-task epic campaigns. Codex records immutable contracts, runs deterministic checks through its normal sandbox, obtains independent review for the current result, and completes only against evidence tied to the full diff from the frozen base.
 
-The plugin includes delivery-writing conventions: compact Jira tasks, post-implementation testing recommendations, one- or two-sentence PR descriptions, natural Russian technical prose, and concise colleague-facing review comments. Drafting text does not authorize changing Jira or publishing to GitHub. Large ideas, high-risk or ambiguous changes, live multi-task epics, and behaviorally complex single tasks keep their approved decomposition in OpenSpec; Agent Harness remains the execution and evidence layer.
+The plugin includes delivery-writing conventions: compact Jira tasks, post-implementation testing recommendations, one- or two-sentence PR descriptions, natural Russian technical prose, and concise colleague-facing review comments. Drafting text does not authorize changing Jira or publishing to GitHub. Large ideas, high-risk or ambiguous changes, live multi-task epics, and behaviorally complex single tasks use an approved specification. New work defaults to native Markdown with one common epic spec and a separate spec for every campaign task; OpenSpec remains an explicit or legacy option. Agent Harness remains the execution and evidence layer.
 
 Prepared tasks persist their native executor settings, acceptance criteria, constraints, required checks, versioned contract references, correction budget, and critic-retry budget. The default executor is `gpt-5.6-sol` with `high` reasoning effort and no default escalation model; an epic plan may explicitly record `gpt-6-astra` for planning or justified escalation. The Codex lead passes the executor settings to the native task. The MCP server never launches or attests Sol itself. Claude remains the fresh read-only critic.
 
@@ -43,7 +43,7 @@ claude auth login
 
 Start a new Codex task after installation so the skills and MCP tools are discovered from the installed snapshot. Ask Codex to check Agent Harness setup; the check does not invoke a model or install anything.
 
-See [`plugins/codex-agent-harness/docs/dependencies.md`](plugins/codex-agent-harness/docs/dependencies.md) for the complete runtime, optional OpenSpec setup, connector, and development-tool inventory bundled with the plugin.
+See [`plugins/codex-agent-harness/docs/dependencies.md`](plugins/codex-agent-harness/docs/dependencies.md) for the complete runtime, native-spec, optional OpenSpec, connector, and development-tool inventory bundled with the plugin.
 
 ## Install from a local checkout
 
@@ -69,7 +69,7 @@ Runtime state is stored per target worktree under:
 <git-common-dir>/codex-agent-harness/campaigns/<campaign-id>/
 ```
 
-Operational state never dirties the worktree. Run contracts stay under the worktree's absolute Git directory; shared campaign state and its approved OpenSpec snapshot live under the common Git directory with mode `0600`. The canonical `/openspec` working folder stays in the project but is ignored by Git by default. Versioned OpenSpec remains an explicit team choice.
+Operational state never dirties the worktree. Run contracts stay under the worktree's absolute Git directory; shared campaign state and its approved specification snapshot live under the common Git directory with mode `0600`. Native drafts use the locally ignored `.agent-harness/specs/<change-id>/spec.md` and `tasks/<task-id>.md`; standalone runs need only `spec.md`. `get_campaign` and `get_run` expose absolute paths to approved snapshots in `spec_context`. Working drafts can change without changing an active campaign's contract. The legacy `/openspec` working folder remains locally ignored by default when that format is selected; versioned OpenSpec remains an explicit team choice.
 
 Repository owners can add path-based risk escalation and deterministic checks through [`docs/configuration.md`](docs/configuration.md). Campaign-linked runs inherit task criteria, constraints, non-goals, forbidden actions, checks, contract references, and execution settings. Callers may add criteria, restrictions, checks, and references but cannot replace the goal, override a same-name check or frozen setting, or weaken inherited requirements.
 

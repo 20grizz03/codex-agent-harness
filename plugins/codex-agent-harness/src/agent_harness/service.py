@@ -25,7 +25,7 @@ from .campaign import (
     verify_openspec_reference,
 )
 from .claude_runtime import ManagedStage
-from .contract import build_contract
+from .contract import build_contract, normalize_contract_refs
 from .followup import FollowupService
 from .git_repo import (
     diff_fingerprint,
@@ -43,6 +43,9 @@ from .policy import (
 from .review import build_stage_prompt, validate_review
 from .verification import closeout_paths, correction_context, optional_snapshot
 from .store import RunStore, SCHEMA_VERSION
+from .specification import (
+    contract_references, is_native, prepare_spec, public_context, task_snapshot,
+)
 from .util import (
     InputError,
     StateError,
@@ -158,11 +161,17 @@ class HarnessService:
                 key: value for key, value in scope.items()
                 if not key.startswith("previous_")
             }
-        return {
+        result = {
             "contract": contract,
             "state": public_state,
             "review": review,
         }
+        if is_native(contract.get("spec")):
+            result["spec_context"] = public_context(
+                contract["spec"],
+                Path(contract["git_dir"]) / "codex-agent-harness" / "runs" / contract["run_id"] / "spec",
+            )
+        return result
 
     @staticmethod
     def _replace_current_review(
@@ -372,6 +381,7 @@ class HarnessService:
         campaign_contract = store.read_contract(campaign_id)
         campaign_state = store.read_state(campaign_id)
         self._require_campaign_open(campaign_state)
+        verify_openspec_reference(campaign_contract, store.context, store.spec_dir(campaign_id))
         definition = self._campaign_task_definition(campaign_contract, task_id)
         if definition.get("kind") != "implementation":
             raise StateError("campaign-linked run requires an implementation task")
@@ -415,7 +425,7 @@ class HarnessService:
 
         task_refs = list(definition.get("contract_refs", []))
         spec = campaign_contract.get("spec")
-        if isinstance(spec, Mapping):
+        if isinstance(spec, Mapping) and not is_native(spec):
             task_refs.append(
                 {
                     "ref": f"openspec:{spec.get('change_id')}",
@@ -696,7 +706,31 @@ class HarnessService:
                 raise InputError("run base_sha conflicts with the pinned followup parent")
             normalized["base_sha"] = followup["parent_sha"]
         parent = self._prepare_campaign_run(normalized, context)
+        spec = None
+        spec_files = None
+        if arguments.get("spec") is not None:
+            if parent is not None:
+                raise InputError("campaign run inherits its approved specification; spec cannot override it")
+            spec, spec_files = prepare_spec(arguments["spec"], context)
+            if spec["readiness"] != "ready":
+                raise InputError("analysis_required specification is not ready for implementation")
+        if parent is not None and is_native(parent["contract"].get("spec")):
+            spec, spec_files = task_snapshot(
+                parent["contract"]["spec"],
+                parent["store"].spec_dir(parent["reference"]["campaign_id"]),
+                parent["reference"]["task_id"],
+            )
+        if spec is not None:
+            inherited_refs = contract_references(spec)
+            inherited = {ref["ref"]: ref["revision"] for ref in inherited_refs}
+            supplied_refs = normalize_contract_refs(normalized.get("contract_refs"))
+            for ref in supplied_refs:
+                if isinstance(ref, Mapping) and ref.get("ref") in inherited and ref.get("revision") != inherited[ref["ref"]]:
+                    raise InputError("contract reference conflicts with the approved specification")
+            normalized["contract_refs"] = [*inherited_refs, *supplied_refs]
         contract, state = build_contract(normalized, context)
+        if spec is not None:
+            contract["spec"] = spec
         if followup is not None:
             contract["followup_ref"] = followup
             contract["followup_context"] = followup_context
@@ -715,7 +749,7 @@ class HarnessService:
                     parent["reference"]["task_id"],
                     contract["runtime_version"],
                 )
-            store.create(contract, state)
+            store.create(contract, state, spec_files)
             store.append_event(
                 contract["run_id"],
                 {"type": "phase_changed", "from": "prepared", "to": "writing"},
@@ -821,15 +855,21 @@ class HarnessService:
 
     @staticmethod
     def _public_campaign(
+        store: CampaignStore,
         contract: dict[str, Any],
         state: dict[str, Any],
         comparison: dict[str, Any],
     ) -> dict[str, Any]:
-        return {
+        result = {
             "contract": contract,
             "state": state,
             "comparison": comparison,
         }
+        if is_native(contract.get("spec")):
+            result["spec_context"] = public_context(
+                contract["spec"], store.spec_dir(contract["campaign_id"]),
+            )
+        return result
 
     @staticmethod
     def _require_campaign_open(state: Mapping[str, Any]) -> None:
@@ -855,6 +895,7 @@ class HarnessService:
                 {"type": "phase_changed", "from": "prepared", "to": "executing"},
             )
         return self._public_campaign(
+            store,
             contract,
             state,
             store.read_comparison(contract["campaign_id"]),
@@ -867,7 +908,7 @@ class HarnessService:
             contract = store.read_contract(campaign_id)
             state = store.read_state(campaign_id)
             comparison = store.read_comparison(campaign_id)
-        return self._public_campaign(contract, state, comparison)
+        return self._public_campaign(store, contract, state, comparison)
 
     def list_campaigns(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
         store = CampaignStore.for_workspace(self._workspace(arguments))

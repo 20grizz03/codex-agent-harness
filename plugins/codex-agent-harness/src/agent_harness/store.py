@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .git_repo import RepoContext, resolve_repo
+from .specification import is_native, verify_snapshot, write_snapshot
 from .util import RUN_ID_RE, StateError, json_copy, utc_now
 
 
@@ -103,6 +104,7 @@ class RunStore:
         self,
         contract: dict[str, Any],
         state: dict[str, Any],
+        spec_files: dict[str, bytes] | None = None,
     ) -> None:
         self._ensure_root()
         directory = self.run_dir(str(contract["run_id"]))
@@ -111,6 +113,8 @@ class RunStore:
         except FileExistsError as exc:
             raise StateError("run_id already exists") from exc
         os.chmod(directory, 0o700)
+        if spec_files is not None:
+            write_snapshot(directory / "spec", spec_files)
         self._create_json(directory / "contract.json", contract)
         self._create_json(directory / "state.json", state)
         self._create_json(
@@ -138,6 +142,8 @@ class RunStore:
         value = self._read_json(self.run_dir(run_id) / "contract.json")
         if value.get("run_id") != run_id:
             raise StateError("contract run_id mismatch")
+        if is_native(value.get("spec")):
+            verify_snapshot(value["spec"], self.run_dir(run_id) / "spec")
         return value
 
     def read_state(self, run_id: str) -> dict[str, Any]:

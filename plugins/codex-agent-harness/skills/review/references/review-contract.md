@@ -1,6 +1,6 @@
 # Independent review contract
 
-The critic receives the immutable task contract, base SHA, current full-result fingerprint, changed paths, check evidence, review cycle, and risk areas. It does not receive a pasted diff and must inspect the repository and Git directly.
+The critic receives the immutable task contract, base SHA, current full-result fingerprint, changed paths, check evidence, review cycle, and risk areas. When `spec_context` exists, its absolute paths identify the approved private snapshot: the common spec and only the current campaign task's spec. A dependency's spec is read only when explicitly referenced by the task contract. The critic does not receive a pasted diff and must inspect the repository and Git directly.
 
 The `critic` profile is read-only: Claude runs with safe mode, plan permissions, no session persistence, no Chrome, no dynamic system-prompt sections, an empty strict MCP configuration, and only `Read`, `Glob`, `Grep`, and `Bash`. `Edit`, `Write`, and `NotebookEdit` are explicitly denied. Bash is limited to read-only repository inspection; project checks remain the Codex lead's responsibility.
 

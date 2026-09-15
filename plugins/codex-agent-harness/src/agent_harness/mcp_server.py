@@ -18,9 +18,11 @@ SERVER_NAME = "agent-harness"
 SERVER_INSTRUCTIONS = (
     "Codex owns epic campaign state, task state, and deterministic checks. "
     "Campaign completion is local and never authorizes tracker or GitHub writes. "
-    "Approved OpenSpec references are semantically fingerprinted and rechecked; "
-    "local mode requires an ignored project /openspec and keeps a private snapshot. "
-    "OpenSpec never replaces campaign execution state. "
+    "Use native Markdown specifications: an epic spec.md and tasks/<task-id>.md, "
+    "or one spec.md for a standalone run, under ignored .agent-harness/specs/<change-id>. "
+    "Approval freezes a private snapshot; read spec_context documents, not mutable drafts. "
+    "Draft edits never change approved execution. Material changes require a newly approved contract. "
+    "Legacy OpenSpec campaigns retain their existing verification rules. "
     "Each implementation run reports categorized diff size against an advisory "
     "review budget; an overage never bypasses checks or blocks them by itself. "
     "A replay candidate must be sealed before historical evidence is compared. "
@@ -145,7 +147,7 @@ CAMPAIGN_SPEC_SCHEMA = {
     "type": "object",
     "required": ["kind", "change_id"],
     "properties": {
-        "kind": {"type": "string", "enum": ["openspec"]},
+        "kind": {"type": "string", "enum": ["harness", "openspec"]},
         "change_id": {
             "type": "string",
             "minLength": 1,
@@ -157,9 +159,12 @@ CAMPAIGN_SPEC_SCHEMA = {
             "enum": ["local", "repository"],
             "default": "local",
             "description": (
-                "Local requires ignored project files and stores a private snapshot; "
-                "repository explicitly uses versioned openspec/changes/<change-id>."
+                "Native harness supports local only; repository is for legacy OpenSpec."
             ),
+        },
+        "readiness": {
+            "type": "string", "enum": ["ready", "analysis_required"],
+            "description": "Required for harness after technical investigation; omit for legacy OpenSpec.",
         },
     },
     "additionalProperties": False,
@@ -328,8 +333,9 @@ TOOLS: list[dict[str, Any]] = [
         "name": "create_campaign",
         "description": (
             "Freeze one local epic campaign with ordered tasks and a server-fingerprinted "
-            "OpenSpec snapshot required for high-risk or multi-task delivery. Ignored project "
-            "storage is the default; versioned repository storage is explicit. Replay campaigns freeze a "
+            "approved specification required for high-risk or multi-task delivery. "
+            "Prefer kind=harness: spec.md plus tasks/<task-id>.md for each task; "
+            "legacy kind=openspec remains supported. Replay campaigns freeze a "
             "cutoff and withheld-evidence categories. Does not read or change Jira "
             "or GitHub."
         ),
@@ -627,7 +633,8 @@ TOOLS: list[dict[str, Any]] = [
         "description": (
             "Create one immutable task contract in target Git metadata before "
             "repository edits. An optional campaign link resolves base, review budget, "
-            "and minimum risk. "
+            "and minimum risk. Optional standalone native spec requires only spec.md; "
+            "campaign runs inherit their approved common and own task documents. "
             "Rejects dirty worktrees unless explicitly acknowledged."
         ),
         "inputSchema": {
@@ -684,6 +691,16 @@ TOOLS: list[dict[str, Any]] = [
                     "maxLength": 64,
                 },
                 "campaign": CAMPAIGN_RUN_SCHEMA,
+                "spec": {
+                    **CAMPAIGN_SPEC_SCHEMA,
+                    "required": ["kind", "change_id", "readiness"],
+                    "properties": {
+                        **CAMPAIGN_SPEC_SCHEMA["properties"],
+                        "kind": {"type": "string", "enum": ["harness"]},
+                        "storage": {"type": "string", "enum": ["local"]},
+                        "readiness": {"type": "string", "enum": ["ready"]},
+                    },
+                },
                 "followup_ref": FOLLOWUP_REF_SCHEMA,
                 "review_budget": REVIEW_BUDGET_SCHEMA,
             },
