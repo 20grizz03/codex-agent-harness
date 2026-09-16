@@ -302,6 +302,14 @@ as a validation gap instead of attempting to bypass the read-only sandbox.
 The review budget is advisory: size alone is not a defect and must not become a
 finding. Review the functional contract and note mixed independent behavior only
 when it creates a concrete correctness, testing, rollout, or rollback risk.
+Within this same review, inspect whether affected tests would detect a material
+violation of the agreed contract. Expected outcomes must be independent of the
+implementation calculation; mocks must not bypass the boundary claimed as tested.
+Reuse sufficient existing proof, without demanding test counts, coverage targets,
+duplicate test levels or an unrelated test-suite audit. Empty, all-skipped or
+unexecuted tests do not prove a scenario, nor does an unexplained successful retry
+erase the first failure. Separate concrete test defects from unproven validation
+gaps and retain the read-only execution restrictions above.
 Choose the verdict only after collecting findings:
 """.strip()
     + "\n"

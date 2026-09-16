@@ -17,6 +17,8 @@ Classify findings before choosing the verdict. The structured result contains:
 
 Ignore style preferences without concrete impact. Do not report a finding based only on a failing check already present in the supplied evidence. P0 and P1 require a reproducible path or direct code evidence.
 
+Apply the review portion of [testing within the task](../../workflow/references/testing.md) in this same critic pass. Inspect whether affected assertions would detect a material violation of the agreed contract, whether expectations are independent of the implementation, and whether mocks bypass the claimed boundary. Retain sufficient existing proof; do not demand test counts, coverage percentages, duplicate test levels or a broader audit. Empty, skipped, unexecuted or unstable runs are not reliable scenario proof. Keep unproven validation gaps distinct from concrete test defects and respect the critic's read-only execution boundary.
+
 Codex independently traces each finding through surrounding production code and tests. Merge duplicates, reject unsupported claims with contrary evidence, and keep `unverified` findings unresolved. A passing Claude verdict does not override a failed deterministic check.
 
 One explicit retry may create a new critic stage only after `transient_timeout` or `transient_process_failure` and only within the immutable one-retry budget. It names the failed stage and is idempotent. The only degraded reviewer is a fresh read-only native Codex subagent after `failure_kind: anthropic_limit`; it follows this contract and is stored with origin `codex_fallback`. Never reinterpret another provider error as a limit.

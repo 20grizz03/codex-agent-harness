@@ -13,6 +13,8 @@ Before creating a run, classify the change as a concise low-risk edit, a small p
 
 For any correction mode, give a short progress report after 15 minutes of active work, separating writing, propagation, checks, review, and external waiting. External waiting does not count toward the active-work threshold; this is not a pause or a new approval gate.
 
+For the selected route, read [testing within the task](references/testing.md) before choosing checks or writing tests. Apply its relevant guidance inside the existing plan, implementation and verification stages; it does not add a QA cycle or override the small publication follow-up exception.
+
 When an `epic-workflow` campaign is active, this skill owns exactly one implementation task. Return its terminal `run_id` to the campaign instead of expanding into sibling tasks.
 
 Before changing files, read [references/protocol.md](references/protocol.md) completely and follow it. Standard runs persist the task contract and evidence with the `agent-harness` MCP tools. The Codex instance that owns the run owns its state tools. Prefer delegating `start_stage`, `poll_stage`, and `cancel_stage` to one native tracking subagent; never launch a second MCP server or process. Claude remains fresh and independent, and only sanitized progress reaches Codex.

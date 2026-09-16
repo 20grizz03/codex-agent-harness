@@ -20,6 +20,8 @@ The concise direct path is available only when inspection makes all of these cle
 
 Use a standard direct run for one narrow, unambiguous functionality. Show a concise plan with the observable result, boundaries, and checks. A typical slice contains 300–700 changed production-code lines, while tests, documentation, configuration, generated files, and binaries are counted separately. This is a soft planning budget; keep an indivisible behavior together and record why it cannot be safely split.
 
+Use [testing within the task](testing.md) to connect changed behavior and risk to existing or missing proof, an expected outcome, safe data and a project-native command. This belongs in the same plan, not a new approval, checklist schema or mandatory QA stage.
+
 Use `epic-workflow` and an approved specification when a task changes concurrency, ordering, retries, recovery, partial failure, idempotency, consistency, security-sensitive data, compatibility, several integrations, or a material architectural contract. Investigate the actual technical boundaries before decomposition. The readiness check must map every requirement to at least one task and every task to a verification scenario. Every attached contract reference must have a pinned revision and its availability must be checked before implementation. For native specs, read [the format and snapshot rules](../../epic-workflow/references/native-spec.md); OpenSpec-specific CLI and schema instructions apply only when that format was selected.
 
 If the user supplied a concrete plan and asked to implement it, that is approval for reversible local work within its boundaries. The authorization persists across turns and covers edits, checks, bounded correction, approved commits, and unchanged retries. Resolve a reversible non-semantic file overlap when the user's intent is clear. The lead may resolve ordinary technical choices inside the contract. Ask only for a product or scope change, a user-owned-file conflict whose intent cannot be determined safely, or an external or irreversible action not already authorized.
@@ -39,6 +41,8 @@ The contract is immutable. A material change to goal, product behavior, scope, o
 ## 4. Write and check the full result
 
 Implement as Codex unless the contract names Claude. Preserve unrelated changes and commit only when authorized.
+
+Write or update scoped tests alongside each finished behavior using [the testing reference](testing.md). Reuse sufficient existing proof. Run affected tests first for feedback, then the full required check set for the final fingerprint; do not accept empty or all-skipped selection as scenario proof. Preserve first failures, justified retries and environment limitations in sanitized summaries. The small publication follow-up exception remains unchanged.
 
 Use `measure_diff` at useful slice boundaries. An `over_soft_limit` result prompts another boundary check but does not block completion. Call `plan_checks` after the diff exists. Its fingerprint covers the full result from the frozen base, including commits, index, working tree, and untracked files without changing the user's index. Run every returned argv through the normal sandbox and record a short sanitized result with `record_check`.
 

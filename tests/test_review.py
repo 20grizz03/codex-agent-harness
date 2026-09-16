@@ -11,6 +11,7 @@ from agent_harness.review import (
     CRITIC_SYSTEM_PROMPT,
     REVIEW_FIELD_DESCRIPTIONS,
     REVIEW_JSON_SCHEMA,
+    build_stage_prompt,
     validate_review,
     validate_review_with_normalization,
 )
@@ -33,6 +34,10 @@ class ReviewNormalizationTests(unittest.TestCase):
         schema = json.loads(command[command.index("--json-schema") + 1])
         self.assertEqual(REVIEW_JSON_SCHEMA, schema)
         self.assertIn(REVIEW_FIELD_DESCRIPTIONS["verdict"], CRITIC_SYSTEM_PROMPT)
+        self.assertEqual(
+            CRITIC_SYSTEM_PROMPT,
+            command[command.index("--append-system-prompt") + 1],
+        )
 
     def test_findings_override_pass_and_are_preserved(self) -> None:
         source = _support.finding_review()
@@ -108,6 +113,62 @@ class ReviewNormalizationTests(unittest.TestCase):
 
         self.assertEqual("pass", review["verdict"])
         self.assertEqual(source["blocking_question"], review["blocking_question"])
+
+
+class ReviewTestEvidenceTests(unittest.TestCase):
+    def packet(self, checks: dict, fingerprint: str = "current") -> dict:
+        prompt = build_stage_prompt(
+            profile="critic",
+            contract={
+                "risk": "medium",
+                "goal": "Сохранить результат обработки сообщения",
+                "done_when": ["Повтор сообщения не меняет сохранённый результат"],
+            },
+            state={
+                "diff_fingerprint": fingerprint,
+                "check_results": checks,
+            },
+        )
+        payload = prompt.split("<agent_harness_packet>\n", 1)[1]
+        return json.loads(payload.split("\n</agent_harness_packet>", 1)[0])
+
+    def test_scenario_limits_reach_critic_without_raw_output(self) -> None:
+        for summary in (
+            "Локальный обработчик и хранилище проверены; настоящий брокер не проверен",
+            "Пройдено 2 сценария; проверка реальной интеграции пропущена",
+            "Первый запуск: ошибка фикстуры; после исправления оба сценария пройдены",
+        ):
+            with self.subTest(summary=summary):
+                check = {
+                    "status": "passed", "exit_code": 0,
+                    "duration_ms": 12, "summary": summary,
+                    "stdout": "raw output must not enter the packet",
+                }
+                packet = self.packet({"current": {"scoped-tests": check}})
+                self.assertEqual([
+                    {"name": "scoped-tests", "status": "passed", "exit_code": 0,
+                     "duration_ms": 12, "summary": summary},
+                ], packet["current_evidence"]["checks"])
+                self.assertEqual(
+                    ["Повтор сообщения не меняет сохранённый результат"],
+                    packet["task_contract"]["done_when"],
+                )
+
+    def test_previous_fingerprint_is_not_current_scenario_proof(self) -> None:
+        packet = self.packet({"old": {"scoped-tests": {
+            "status": "passed", "exit_code": 0,
+            "duration_ms": 12, "summary": "Все сценарии пройдены",
+        }}})
+        self.assertEqual([], packet["current_evidence"]["checks"])
+
+    def test_missing_and_failed_evidence_are_not_promoted_to_pass(self) -> None:
+        self.assertEqual([], self.packet({})["current_evidence"]["checks"])
+        packet = self.packet({"current": {"scoped-tests": {
+            "status": "failed", "exit_code": 1,
+            "duration_ms": 12, "summary": "Повтор создал вторую запись",
+        }}})
+        self.assertEqual("failed", packet["current_evidence"]["checks"][0]["status"])
+        self.assertEqual(1, packet["current_evidence"]["checks"][0]["exit_code"])
 
 
 if __name__ == "__main__":
