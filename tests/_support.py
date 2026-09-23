@@ -269,14 +269,14 @@ if write_path:
         os.environ.get("FAKE_CLAUDE_WRITE_CONTENT", "written by fake claude\\n"),
         encoding="utf-8",
     )
-print(json.dumps({{"type": "system", "subtype": "init", "model": os.environ.get("FAKE_CLAUDE_MODEL", "claude-opus-5")}}), flush=True)
+print(json.dumps({{"type": "system", "subtype": "init", "model": os.environ.get("FAKE_CLAUDE_MODEL", "claude-opus-5-5")}}), flush=True)
 print(json.dumps({{"type": "stream_event", "event": {{"type": "content_block_start", "content_block": {{"type": "tool_use", "name": "Read", "id": "tool-secret-id", "input": {{"token": "hidden"}}}}}}}}), flush=True)
 print(json.dumps({{"type": "stream_event", "event": {{"type": "content_block_delta", "delta": {{"type": "text_delta", "text": "x" * 600}}}}}}), flush=True)
 result = json.loads(os.environ["FAKE_CLAUDE_RESULT"])
 print(json.dumps({{
     "type": "result",
     "structured_output": result,
-    "model": os.environ.get("FAKE_CLAUDE_MODEL", "claude-opus-5"),
+    "model": os.environ.get("FAKE_CLAUDE_MODEL", "claude-opus-5-5"),
     "effort": "high",
     "duration_ms": 25,
     "num_turns": 2,
@@ -305,7 +305,7 @@ def fake_environment(
     environ.update(
         {
             "AGENT_HARNESS_CLAUDE_BIN": str(fake_claude),
-            "AGENT_HARNESS_CLAUDE_MODEL": "claude-opus-5",
+            "AGENT_HARNESS_CLAUDE_MODEL": "claude-opus-5-5",
             "AGENT_HARNESS_TIMEOUT_SECONDS": "30",
             "AGENT_HARNESS_HEARTBEAT_SECONDS": "1",
             "AGENT_HARNESS_STALL_SECONDS": "5",

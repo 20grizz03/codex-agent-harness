@@ -19,7 +19,7 @@ When an `epic-workflow` campaign is active, this skill owns exactly one implemen
 
 Before changing files, read [references/protocol.md](references/protocol.md) completely and follow it. Standard runs persist the task contract and evidence with the `agent-harness` MCP tools. The Codex instance that owns the run owns its state tools. Prefer delegating `start_stage`, `poll_stage`, and `cancel_stage` to one native tracking subagent; never launch a second MCP server or process. Claude remains fresh and independent, and only sanitized progress reaches Codex.
 
-Prepared campaign tasks default to native `gpt-5.6-sol` execution at `high` reasoning effort. The campaign lead passes both stored values explicitly when spawning the executor; the MCP server records this planning contract but does not attest which native model ran. Claude may use `implement` only when the user explicitly requests it. Otherwise Claude is the fresh read-only critic.
+Prepared campaign tasks default to native `gpt-6-sol` execution at `high` reasoning effort. The campaign lead passes both stored values explicitly when spawning the executor; the MCP server records this planning contract but does not attest which native model ran. Claude may use `implement` only when the user explicitly requests it. Otherwise Claude is the fresh read-only critic.
 
 For a reviewed but unfinished candidate, read [review follow-ups](references/review-followups.md) before choosing another full cycle. It defines scoped correction review and a server-validated nonsemantic P3 closeout that retains the original review provenance while rerunning mandatory checks.
 

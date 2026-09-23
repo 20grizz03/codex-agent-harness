@@ -27,7 +27,7 @@ from .review import (
 from .util import InputError, numeric_tree, sanitize_text, utc_now
 
 
-DEFAULT_MODEL = "claude-opus-5"
+DEFAULT_MODEL = "claude-opus-5-5"
 BILLING_ENV_VARS = (
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_BASE_URL",

@@ -28,7 +28,7 @@ Codex остаётся ведущим. Используй нативный пл�
 
 ```yaml
 execution:
-  native_model: gpt-5.6-sol
+  native_model: gpt-6-sol
   reasoning_effort: high
   escalation_model: gpt-6-astra
 max_correction_passes: 2

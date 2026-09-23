@@ -29,7 +29,7 @@ class ReviewNormalizationTests(unittest.TestCase):
     def test_critic_cli_receives_schema_and_explicit_verdict_rules(self) -> None:
         with _support.TempRepo() as repo:
             command = build_command(
-                "/fake/claude", profile="critic", model="claude-opus-5", cwd=repo.path
+                "/fake/claude", profile="critic", model="claude-opus-5-5", cwd=repo.path
             )
         schema = json.loads(command[command.index("--json-schema") + 1])
         self.assertEqual(REVIEW_JSON_SCHEMA, schema)

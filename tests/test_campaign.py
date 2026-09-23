@@ -126,7 +126,7 @@ class CampaignTests(unittest.TestCase):
             )["contract"]
 
             self.assertEqual("Complete T-1", run["goal"])
-            self.assertEqual("gpt-5.6-sol", run["execution"]["native_model"])
+            self.assertEqual("gpt-6-sol", run["execution"]["native_model"])
             self.assertEqual("high", run["execution"]["reasoning_effort"])
             self.assertIsNone(run["execution"]["escalation_model"])
             self.assertEqual(2, run["max_correction_passes"])

@@ -32,7 +32,7 @@ Before editing on the standard path, call `create_run` with the goal, observable
 
 For a campaign task, also pass its campaign reference. The server requires the linked goal to match the task and inherits `done_when`, constraints, non-goals, forbidden actions, checks, contract references, execution settings, review budget, correction budget, and critic-retry budget. The run may add criteria, constraints, non-goals, forbidden actions, checks, and references; it cannot override a same-name check or any frozen setting. Read `get_run.spec_context` and use the frozen common spec plus this task's own spec, not mutable working drafts or unrelated task specs. In legacy OpenSpec campaigns, the approved change remains a pinned `openspec:<change-id>` reference.
 
-Prepared tasks store `execution.native_model`, `execution.reasoning_effort`, and optional `execution.escalation_model`. Default native execution is `gpt-5.6-sol` with `high` effort and a null escalation model; an epic plan may explicitly set `gpt-6-astra`. The lead passes the native model and effort explicitly to the executor. Execution fields are planning metadata: MCP does not launch or attest the native model.
+Prepared tasks store `execution.native_model`, `execution.reasoning_effort`, and optional `execution.escalation_model`. Default native execution is `gpt-6-sol` with `high` effort and a null escalation model; an epic plan may explicitly set `gpt-6-astra`. The lead passes the native model and effort explicitly to the executor. Execution fields are planning metadata: MCP does not launch or attest the native model.
 
 Use `writer: claude` only after an explicit current-task request and set `writer_explicit: true`. Never use one provider as both writer and independent critic.
 

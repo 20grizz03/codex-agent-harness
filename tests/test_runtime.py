@@ -12,6 +12,7 @@ from agent_harness.claude_runtime import (
     SANDBOX_SETTINGS,
     build_command,
     check_runtime,
+    resolve_model,
 )
 from agent_harness.service import HarnessService
 from agent_harness.util import InputError, StateError
@@ -31,6 +32,12 @@ def _command_settings(command: list[str]) -> dict:
 
 
 class ReadinessTests(unittest.TestCase):
+    def test_explicit_legacy_opus_override_is_preserved(self) -> None:
+        self.assertEqual(
+            "claude-opus-5",
+            resolve_model({"AGENT_HARNESS_CLAUDE_MODEL": "claude-opus-5"}),
+        )
+
     def test_ready_subscription_runtime_does_not_invoke_model(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -39,8 +46,11 @@ class ReadinessTests(unittest.TestCase):
             environ = _support.fake_environment(
                 fake, FAKE_CLAUDE_MARKER=str(marker)
             )
+            environ.pop("AGENT_HARNESS_CLAUDE_MODEL")
             report = check_runtime(environ)
             self.assertTrue(report["ok"])
+            self.assertEqual("claude-opus-5-5", report["profile"]["requested_model"])
+            self.assertEqual("high", report["profile"]["requested_effort"])
             self.assertFalse(report["model_invoked"])
             self.assertFalse(marker.exists())
             self.assertEqual([], report["billing_guard"]["active_environment"])
@@ -125,10 +135,12 @@ class CommandTests(unittest.TestCase):
             command = build_command(
                 "/fake/claude",
                 profile="critic",
-                model="claude-opus-5",
+                model="claude-opus-5-5",
                 cwd=repo.path,
             )
         joined = " ".join(command)
+        self.assertEqual("claude-opus-5-5", command[command.index("--model") + 1])
+        self.assertEqual("high", command[command.index("--effort") + 1])
         self.assertIn("--permission-mode plan", joined)
         self.assertIn("--tools Read,Glob,Grep,Bash", joined)
         self.assertIn("--disallowedTools Edit,Write,NotebookEdit", joined)
@@ -143,7 +155,7 @@ class CommandTests(unittest.TestCase):
             command = build_command(
                 "/fake/claude",
                 profile="critic",
-                model="claude-opus-5",
+                model="claude-opus-5-5",
                 cwd=repo.path,
             )
 
@@ -174,7 +186,7 @@ class CommandTests(unittest.TestCase):
             command = build_command(
                 "/fake/claude",
                 profile="critic",
-                model="claude-opus-5",
+                model="claude-opus-5-5",
                 cwd=worktree,
             )
 
@@ -186,12 +198,12 @@ class CommandTests(unittest.TestCase):
     def test_critic_command_fails_closed_without_git_workspace(self) -> None:
         with self.assertRaisesRegex(InputError, "requires a Git workspace"):
             build_command(
-                "/fake/claude", profile="critic", model="claude-opus-5"
+                "/fake/claude", profile="critic", model="claude-opus-5-5"
             )
 
     def test_implement_command_is_distinct(self) -> None:
         command = build_command(
-            "/fake/claude", profile="implement", model="claude-opus-5"
+            "/fake/claude", profile="implement", model="claude-opus-5-5"
         )
         joined = " ".join(command)
         self.assertIn("--permission-mode auto", joined)
@@ -206,7 +218,7 @@ class ManagedStageTests(unittest.TestCase):
         root: Path,
         *,
         mode: str = "success",
-        model: str = "claude-opus-5",
+        model: str = "claude-opus-5-5",
         timeout: int = 30,
     ) -> tuple[ManagedStage, list[dict], list[dict]]:
         _initialize_git_repository(root)
@@ -224,12 +236,12 @@ class ManagedStageTests(unittest.TestCase):
             run_id="run-test",
             profile="critic",
             command=build_command(
-                str(fake), profile="critic", model="claude-opus-5", cwd=root
+                str(fake), profile="critic", model="claude-opus-5-5", cwd=root
             ),
             cwd=root,
             prompt="review the repository",
             environ=environ,
-            requested_model="claude-opus-5",
+            requested_model="claude-opus-5-5",
             timeout_seconds=timeout,
             heartbeat_seconds=1,
             stall_seconds=5,
@@ -252,6 +264,9 @@ class ManagedStageTests(unittest.TestCase):
             self.assertNotIn("x" * 100, rendered)
             self.assertIn("assistant_progress", rendered)
             self.assertEqual("pass", terminal["result"]["verdict"])
+            self.assertEqual("claude-opus-5-5", terminal["telemetry"]["requested_model"])
+            self.assertEqual(["claude-opus-5-5"], terminal["telemetry"]["actual_models"])
+            self.assertEqual("met", terminal["telemetry"]["quality_floor_status"])
             self.assertNotIn("review_normalization", terminal["telemetry"])
 
     def test_contradictory_review_is_normalized_with_allowlisted_telemetry(self) -> None:
@@ -267,12 +282,12 @@ class ManagedStageTests(unittest.TestCase):
                 run_id="run-test",
                 profile="critic",
                 command=build_command(
-                    str(fake), profile="critic", model="claude-opus-5", cwd=root
+                    str(fake), profile="critic", model="claude-opus-5-5", cwd=root
                 ),
                 cwd=root,
                 prompt="review the repository",
                 environ=environ,
-                requested_model="claude-opus-5",
+                requested_model="claude-opus-5-5",
                 timeout_seconds=30,
                 heartbeat_seconds=1,
                 stall_seconds=5,
@@ -310,12 +325,12 @@ class ManagedStageTests(unittest.TestCase):
                 run_id="run-test",
                 profile="critic",
                 command=build_command(
-                    str(fake), profile="critic", model="claude-opus-5", cwd=root
+                    str(fake), profile="critic", model="claude-opus-5-5", cwd=root
                 ),
                 cwd=root,
                 prompt="review the repository",
                 environ=environ,
-                requested_model="claude-opus-5",
+                requested_model="claude-opus-5-5",
                 timeout_seconds=30,
                 heartbeat_seconds=1,
                 stall_seconds=5,
@@ -347,12 +362,12 @@ class ManagedStageTests(unittest.TestCase):
                 run_id="run-test",
                 profile="critic",
                 command=build_command(
-                    str(fake), profile="critic", model="claude-opus-5", cwd=root
+                    str(fake), profile="critic", model="claude-opus-5-5", cwd=root
                 ),
                 cwd=root,
                 prompt="review the repository",
                 environ=environ,
-                requested_model="claude-opus-5",
+                requested_model="claude-opus-5-5",
                 timeout_seconds=30,
                 heartbeat_seconds=1,
                 stall_seconds=5,
@@ -435,12 +450,12 @@ class ManagedStageTests(unittest.TestCase):
                 run_id="run-test",
                 profile="critic",
                 command=build_command(
-                    str(fake), profile="critic", model="claude-opus-5", cwd=root
+                    str(fake), profile="critic", model="claude-opus-5-5", cwd=root
                 ),
                 cwd=root,
                 prompt="review the repository",
                 environ=_support.fake_environment(fake, _support.PASS_REVIEW),
-                requested_model="claude-opus-5",
+                requested_model="claude-opus-5-5",
                 timeout_seconds=30,
                 heartbeat_seconds=1,
                 stall_seconds=5,

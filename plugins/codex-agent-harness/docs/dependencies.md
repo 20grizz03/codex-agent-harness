@@ -17,10 +17,10 @@ These components are required for a complete implementation run:
 | Component | Purpose | Setup |
 | --- | --- | --- |
 | Codex with plugin support | Runs the workflow and bundled MCP server | Install Codex, then follow the repository README |
-| Native `gpt-5.6-sol` availability | Executes prepared implementation tasks at the stored reasoning effort | Confirm the model is available on the target Codex host before the task wave |
+| Native `gpt-6-sol` availability | Executes prepared implementation tasks at the stored reasoning effort | Confirm the model is available on the target Codex host before the task wave |
 | Git | Finds the repository, computes diff fingerprints, and isolates dirty worktrees | Install with the operating system developer tools |
 | Python 3 | Runs the bundled MCP server and tests | Make `python3` available on `PATH` |
-| Claude Code CLI | Provides the independent read-only critic | Install Claude Code and run `claude auth login` interactively |
+| Claude Code CLI with `claude-opus-5-5` access | Provides the independent read-only critic at `high` effort by default | Install Claude Code and run `claude auth login` interactively |
 
 Claude must use first-party subscription OAuth. `check_runtime` rejects API keys, custom Anthropic endpoints, Bedrock, Vertex, and Foundry routing and never invokes a model itself. Native Codex model selection is separate planning metadata; Agent Harness does not launch or attest the selected Codex model.
 
