@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import stat
@@ -10,7 +11,80 @@ from pathlib import PurePosixPath
 from typing import Any, Mapping
 
 from .git_repo import RepoContext, run_git, status_snapshot
-from .util import StateError
+from .util import InputError, StateError, require_string, sanitize_text
+
+
+def evidence_identity(context: RepoContext, contract: Mapping[str, Any]) -> dict[str, str]:
+    """Bind check and review evidence to both the Git revision and frozen contract."""
+    digest = hashlib.sha256(json.dumps(
+        contract, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")).hexdigest()
+    return {"head_sha": context.head_sha, "contract_sha256": digest}
+
+
+def require_fresh_evidence(
+    context: RepoContext, contract: Mapping[str, Any], recorded: Any,
+) -> None:
+    if not isinstance(recorded, Mapping) or dict(recorded) != evidence_identity(context, contract):
+        raise StateError("checks and review are stale for the current HEAD or contract; plan checks again")
+
+
+def require_frozen_contract(
+    context: RepoContext, contract: Mapping[str, Any], state: Mapping[str, Any],
+) -> None:
+    frozen_sha256 = state.get("contract_sha256")
+    if not isinstance(frozen_sha256, str) or evidence_identity(context, contract)["contract_sha256"] != frozen_sha256:
+        raise StateError("frozen contract changed; create a new run with an approved contract")
+
+
+def scope_violations(paths: list[str], allowed: list[str]) -> list[str]:
+    """A trailing slash covers descendants; other entries name exact files."""
+    if not allowed:
+        return []
+    return sorted(path for path in paths if not any(
+        path.startswith(rule) if rule.endswith("/") else path == rule
+        for rule in allowed
+    ))
+
+
+def product_evidence(target: Any, supplied: Any) -> tuple[dict[str, Any] | None, list[str]]:
+    """Evaluate the declared operating target without assuming production.
+
+    Evidence is a bounded, sanitized human attestation. The caller must also
+    retain its Git and contract identity and compare those before completion.
+    """
+    if target is None:
+        if supplied is not None:
+            raise InputError("product_evidence requires a frozen product_target")
+        return None, []
+    if not isinstance(supplied, Mapping) or set(supplied) != {"runtime", "external"}:
+        raise InputError("product_evidence must contain runtime and external")
+    runtime = supplied["runtime"]
+    external = supplied["external"]
+    if not isinstance(runtime, list) or len(runtime) > 16:
+        raise InputError("product_evidence.runtime must contain at most 16 entries")
+    runtime_refs = [sanitize_text(require_string(item, "runtime evidence", maximum=1000), maximum=1000) for item in runtime]
+    if not isinstance(external, Mapping):
+        raise InputError("product_evidence.external must be an object")
+    dependencies = target.get("external_dependencies", [])
+    if set(external) != set(dependencies):
+        raise InputError("product_evidence.external must cover exactly the frozen dependencies")
+    normalized = {}
+    blockers = []
+    if target.get("runtime_required") and not runtime_refs:
+        blockers.append("runtime evidence is missing for the declared operating mode")
+    for dependency in dependencies:
+        item = external[dependency]
+        if not isinstance(item, Mapping) or set(item) != {"status", "evidence"}:
+            raise InputError("each external dependency needs status and evidence")
+        status = item["status"]
+        if not isinstance(status, str) or status not in {"complete", "blocked"}:
+            raise InputError("external dependency status must be complete or blocked")
+        evidence = sanitize_text(require_string(item["evidence"], "external evidence", maximum=1000), maximum=1000)
+        normalized[dependency] = {"status": status, "evidence": evidence}
+        if status == "blocked":
+            blockers.append(f"external dependency remains blocked: {dependency}")
+    return {"runtime": runtime_refs, "external": normalized}, blockers
 
 
 def review_snapshot(context: RepoContext) -> dict[str, Any]:

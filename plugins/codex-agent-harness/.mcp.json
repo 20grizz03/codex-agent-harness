@@ -45,6 +45,7 @@
         "poll_stage",
         "cancel_stage",
         "record_review_resolution",
+        "record_codex_telemetry",
         "finish_run"
       ]
     }

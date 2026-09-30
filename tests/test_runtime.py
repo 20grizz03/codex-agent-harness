@@ -13,6 +13,7 @@ from agent_harness.claude_runtime import (
     build_command,
     check_runtime,
     resolve_model,
+    _provider_error_diagnostic,
 )
 from agent_harness.service import HarnessService
 from agent_harness.util import InputError, StateError
@@ -393,6 +394,33 @@ class ManagedStageTests(unittest.TestCase):
             self.assertNotIn("super-secret-value", rendered)
             self.assertGreater(terminal["telemetry"]["provider_stderr_chars"], 0)
             self.assertGreater(terminal["telemetry"]["invalid_lines"], 0)
+
+    def test_api_request_error_keeps_safe_reason_not_raw_stream(self) -> None:
+        for mode in ("api_request_error", "api_assistant_error", "api_zero_exit_error"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                stage, events, terminals = self._stage(Path(directory), mode=mode)
+                terminal = _support.wait_until(lambda: stage.poll().get("terminal"))
+                self.assertEqual("failed", terminal["lifecycle_state"])
+                self.assertEqual("request_configuration", terminal["failure_kind"])
+                self.assertEqual(0 if mode == "api_zero_exit_error" else 1, terminal["telemetry"]["exit_code"])
+                self.assertEqual({"http_status": 400, "code": "thinking_config_incompatible"},
+                                 terminal["telemetry"]["provider_error"])
+                rendered = repr(events) + repr(terminals) + repr(terminal)
+                for private in ("private-provider-value", "private-session-id", "thinking.type.enabled"):
+                    self.assertNotIn(private, rendered)
+
+    def test_provider_diagnostic_only_returns_fixed_codes_and_status(self) -> None:
+        for source, expected in (
+            ({"result": "API Error: 400 secret-value"}, {"http_status": 400, "code": "api_request_rejected"}),
+            ({"error": "API Error: 403 secret-value"}, {"http_status": 403, "code": "api_http_error"}),
+            ({"status_code": 400, "message": "secret-value"}, {"http_status": 400, "code": "api_request_rejected"}),
+            ({"code": "secret-value", "message": "unrecognized failure"}, {}),
+            ({"status": True}, {}),
+            ({"message": "API Error: 400 output_config.effort 'high' is not supported when thinking is disabled"},
+             {"http_status": 400, "code": "effort_thinking_incompatible"}),
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(expected, _provider_error_diagnostic(source))
 
     def test_anthropic_limit_is_classified_without_exposing_provider_text(self) -> None:
         for mode in ("limit_stderr", "limit_result", "limit_after_safety"):

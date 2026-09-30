@@ -20,9 +20,21 @@ These components are required for a complete implementation run:
 | Native `gpt-6-sol` availability | Executes prepared implementation tasks at the stored reasoning effort | Confirm the model is available on the target Codex host before the task wave |
 | Git | Finds the repository, computes diff fingerprints, and isolates dirty worktrees | Install with the operating system developer tools |
 | Python 3 | Runs the bundled MCP server and tests | Make `python3` available on `PATH` |
-| Claude Code CLI with `claude-opus-5-5` access | Provides the independent read-only critic at `high` effort by default | Install Claude Code and run `claude auth login` interactively |
+| Claude Code CLI 2.1.280+ with `claude-opus-5-5` access | Provides the independent read-only critic at `high` effort by default | Update Claude Code; run `claude auth login` interactively only when public auth status confirms logout |
 
 Claude must use first-party subscription OAuth. `check_runtime` rejects API keys, custom Anthropic endpoints, Bedrock, Vertex, and Foundry routing and never invokes a model itself. Native Codex model selection is separate planning metadata; Agent Harness does not launch or attest the selected Codex model.
+
+### Диагностика Claude Code
+
+Для Opus 5.5 нужен Claude Code 2.1.280 или новее; для закреплённого Opus 5 — 2.1.219 или новее. Авторизация и наличие флагов сами по себе не подтверждают совместимость. `check_runtime` возвращает `cli_model_incompatible` до создания этапа и расхода попытки; неизвестный формат версии — `cli_version_unknown`. Версии сверены с [официальной документацией](https://code.claude.com/docs/en/errors#thinking-type-enabled-is-not-supported-for-this-model). Обновление CLI выполняется отдельно, не автоматически из Harness.
+
+При отказе API сохраняются числовые `telemetry.exit_code`, `telemetry.provider_error.http_status` и фиксированный код причины, без исходного сообщения. HTTP 400 и несовместимые параметры thinking получают `request_configuration`; они не разрешают повтор или переход к другой модели. Ошибка может прийти в сообщении `assistant` или в результате с `subtype: success` и `is_error: true` — это не успешное ревью.
+
+`check_runtime` запускает только `--version`, `auth status --json` и `--help` из отдельного временного каталога. Удаление рабочего каталога сервера не должно мешать этой проверке. Каталог самого ревью остаётся рабочим репозиторием; права критика не меняются.
+
+В неуспешном результате `error_code` различает отсутствие CLI (`cli_not_found`), ошибку запуска (`cli_spawn_failed`), тайм-аут (`cli_timeout`), ошибку команды (`cli_command_failed`), некорректный ответ авторизации (`auth_invalid_response`) и явное отсутствие авторизации (`authentication_required`). Для диагностической команды возвращаются `failed_check` и, при наличии, `exit_code`, без сырых stdout/stderr. Ограничения модели, биллинга и обязательных флагов сохраняются.
+
+Только корректный ответ с логическим `loggedIn: false` означает, что CLI не видит авторизацию в текущей среде. Неудачный запуск или некорректный JSON не означают выход из аккаунта: `auth` остаётся неизвестным. Если терминал и MCP расходятся, сравни публичный статус авторизации в среде запуска сервера и обычном терминале до предложения `claude auth login`. Не переноси токены и не снимай ограничения песочницы ради успешной проверки. Неудачная диагностика до вызова модели не расходует попытку критика и не завершает прогон; после устранения причины можно повторить запуск этапа в том же прогоне.
 
 ## Specification-backed decomposition
 

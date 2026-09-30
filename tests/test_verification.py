@@ -10,12 +10,155 @@ from agent_harness.git_repo import resolve_repo
 from agent_harness.service import HarnessService
 from agent_harness.store import RunStore
 from agent_harness.util import StateError, InputError
-from agent_harness.verification import closeout_paths, correction_context, optional_snapshot, review_snapshot
+from agent_harness.verification import (
+    closeout_paths, correction_context, evidence_identity, optional_snapshot,
+    product_evidence, require_fresh_evidence, require_frozen_contract,
+    review_snapshot, scope_violations,
+)
 from test_workflow import run_planned_checks, wait_for_stage
 from test_campaign import campaign_arguments, complete_run, task
 
 
 class VerificationReuseTests(unittest.TestCase):
+    def test_push_scope_and_evidence_are_bound_to_head_and_contract(self):
+        with _support.TempRepo() as repo:
+            context = resolve_repo(repo.path)
+            contract = {"goal": "Implement scoped push", "scope_paths": ["internal/push/"]}
+            pinned = evidence_identity(context, contract)
+            self.assertEqual([], scope_violations(["internal/push/service.go"], contract["scope_paths"]))
+            self.assertEqual(["internal/auth/secrets.go"], scope_violations(
+                ["internal/push/service.go", "internal/auth/secrets.go"], contract["scope_paths"]
+            ))
+            require_fresh_evidence(context, contract, pinned)
+            require_frozen_contract(context, contract, {"contract_sha256": pinned["contract_sha256"]})
+            with self.assertRaisesRegex(StateError, "stale"):
+                require_fresh_evidence(context, {**contract, "goal": "Expand push"}, pinned)
+            with self.assertRaisesRegex(StateError, "frozen contract"):
+                require_frozen_contract(context, {**contract, "goal": "Expand push"}, {"contract_sha256": pinned["contract_sha256"]})
+            (repo.path / "README.md").write_text("new commit\n")
+            _support.git(repo.path, "add", "README.md")
+            _support.git(repo.path, "commit", "-m", "advance head")
+            with self.assertRaisesRegex(StateError, "stale"):
+                require_fresh_evidence(resolve_repo(repo.path), contract, pinned)
+
+    def test_scope_path_escape_and_unexpected_push_change_are_rejected(self):
+        with _support.TempRepo() as repo:
+            service = HarnessService({})
+            for bad in ["../outside", "/absolute", "internal//push/", "./internal/push/"]:
+                with self.subTest(path=bad), self.assertRaises(InputError):
+                    service.create_run({
+                        "workspace": str(repo.path), "goal": "Scoped push",
+                        "done_when": ["Push works"], "scope_paths": [bad],
+                    })
+            created = service.create_run({
+                "workspace": str(repo.path), "goal": "Scoped push",
+                "done_when": ["Push works"], "scope_paths": ["internal/push/"],
+            })
+            (repo.path / "internal" / "push").mkdir(parents=True)
+            (repo.path / "internal" / "push" / "service.go").write_text("package push\n")
+            (repo.path / "internal" / "auth").mkdir()
+            (repo.path / "internal" / "auth" / "secrets.go").write_text("package auth\n")
+            with self.assertRaisesRegex(StateError, "scope"):
+                service.plan_checks({"workspace": str(repo.path), "run_id": created["contract"]["run_id"]})
+
+    def test_sip_pilot_gate_does_not_require_production(self):
+        pilot = {
+            "operating_mode": "SIP pilot on test VM",
+            "runtime_required": True,
+            "external_dependencies": [],
+        }
+        evidence, blockers = product_evidence(pilot, {
+            "runtime": ["Test VM SIP flow observed 180/183 and CANCEL"],
+            "external": {},
+        })
+        self.assertEqual([], blockers)
+        self.assertEqual({}, evidence["external"])
+        production = {
+            "operating_mode": "Production SIP service",
+            "runtime_required": True,
+            "external_dependencies": ["production deployment"],
+        }
+        _, blockers = product_evidence(production, {
+            "runtime": [],
+            "external": {"production deployment": {
+                "status": "blocked", "evidence": "Deployment approval pending",
+            }},
+        })
+        self.assertEqual(2, len(blockers))
+        self.assertIn("runtime evidence", blockers[0])
+        self.assertIn("production deployment", blockers[1])
+
+    def test_planned_check_rejects_head_and_contract_drift(self):
+        for drift in ("head", "contract"):
+            with self.subTest(drift=drift), _support.TempRepo() as repo:
+                service = HarnessService({})
+                created = service.create_run({
+                    "workspace": str(repo.path), "goal": "Scoped push",
+                    "done_when": ["Push works"],
+                })
+                run_id = created["contract"]["run_id"]
+                common = {"workspace": str(repo.path), "run_id": run_id}
+                (repo.path / "README.md").write_text("push changed\n")
+                planned = service.plan_checks(common)
+                if drift == "head":
+                    _support.git(repo.path, "add", "README.md")
+                    _support.git(repo.path, "commit", "-m", "push change")
+                else:
+                    store = RunStore.for_workspace(repo.path)
+                    contract = store.read_contract(run_id)
+                    contract["goal"] = "Changed contract without reapproval"
+                    RunStore._atomic_json(store.run_dir(run_id) / "contract.json", contract)
+                with self.assertRaisesRegex(StateError, "stale" if drift == "head" else "frozen contract"):
+                    service.record_check({
+                        **common, "check_name": planned["checks"][0]["name"],
+                        "exit_code": 0, "duration_ms": 1,
+                    })
+                if drift == "head":
+                    replanned = service.plan_checks(common)
+                    self.assertFalse(replanned["deduplicated"])
+                else:
+                    with self.assertRaisesRegex(StateError, "frozen contract"):
+                        service.plan_checks(common)
+
+    def test_replanned_head_cannot_reuse_old_critic_review(self):
+        with _support.TempRepo() as repo, tempfile.TemporaryDirectory() as temporary:
+            service = HarnessService(_support.fake_environment(
+                _support.make_fake_claude(Path(temporary)), _support.PASS_REVIEW
+            ))
+            created = service.create_run({
+                "workspace": str(repo.path), "goal": "Update push documentation",
+                "done_when": ["Documentation is correct"],
+            })
+            common = {"workspace": str(repo.path), "run_id": created["contract"]["run_id"]}
+            (repo.path / "README.md").write_text("updated\n")
+            run_planned_checks(service, repo.path, common["run_id"])
+            stage = service.start_stage({**common, "profile": "critic"})
+            wait_for_stage(service, repo.path, common["run_id"], stage["stage_id"])
+            service.record_review_resolution({**common, "resolutions": []})
+            _support.git(repo.path, "add", "README.md")
+            _support.git(repo.path, "commit", "-m", "advance reviewed head")
+            with self.assertRaisesRegex(StateError, "stale"):
+                service.finish_run({**common, "status": "complete"})
+            run_planned_checks(service, repo.path, common["run_id"])
+            with self.assertRaisesRegex(StateError, "stale"):
+                service.finish_run({**common, "status": "complete"})
+
+    def test_fallback_requires_same_head_and_contract_as_limit_stage(self):
+        state = {
+            "review_cycle": 0,
+            "diff_fingerprint": "same-diff",
+            "evidence_identity": {"head_sha": "new-head", "contract_sha256": "contract"},
+            "stages": {"old-limit": {
+                "profile": "critic", "lifecycle_state": "failed",
+                "failure_kind": "anthropic_limit", "review_cycle": 1,
+                "diff_fingerprint": "same-diff",
+                "evidence_identity": {"head_sha": "old-head", "contract_sha256": "contract"},
+            }},
+        }
+        self.assertFalse(HarnessService._codex_fallback_allowed(state))
+        state["stages"]["old-limit"]["evidence_identity"] = state["evidence_identity"]
+        self.assertTrue(HarnessService._codex_fallback_allowed(state))
+
     def review_file(self, path="README.md", severity="P3"):
         review = _support.finding_review(severity)
         review["findings"][0]["file"] = path

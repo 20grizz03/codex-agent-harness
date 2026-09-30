@@ -9,6 +9,7 @@ import re
 import shutil
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -28,6 +29,11 @@ from .util import InputError, numeric_tree, sanitize_text, utc_now
 
 
 DEFAULT_MODEL = "claude-opus-5-5"
+# https://code.claude.com/docs/en/errors#thinking-type-enabled-is-not-supported-for-this-model
+MODEL_MINIMUM_CLI = {
+    "claude-opus-5": (2, 1, 219),
+    "claude-opus-5-5": (2, 1, 280),
+}
 BILLING_ENV_VARS = (
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_BASE_URL",
@@ -122,7 +128,8 @@ def resolve_claude_bin(environ: Mapping[str, str]) -> str | None:
     if override:
         candidate = Path(override).expanduser()
         return str(candidate.resolve()) if candidate.is_file() else None
-    return shutil.which("claude", path=environ.get("PATH"))
+    candidate = shutil.which("claude", path=environ.get("PATH"))
+    return str(Path(candidate).absolute()) if candidate else None
 
 
 def resolve_model(environ: Mapping[str, str]) -> str:
@@ -171,24 +178,23 @@ def _capture(
     command: Sequence[str],
     *,
     environ: Mapping[str, str],
+    cwd: Path,
     timeout: int = 15,
 ) -> subprocess.CompletedProcess[str]:
-    try:
-        return subprocess.run(
-            list(command),
-            env=dict(environ),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-            check=False,
-            **_process_group_kwargs(),
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise InputError(f"Claude Code readiness check failed: {exc}") from exc
+    return subprocess.run(
+        list(command),
+        env=dict(environ),
+        cwd=str(cwd),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+        check=False,
+        **_process_group_kwargs(),
+    )
 
 
 def _json_object(value: str) -> dict[str, Any]:
@@ -227,48 +233,99 @@ def check_runtime(environ: Mapping[str, str] | None = None) -> dict[str, Any]:
         },
         "model_invoked": False,
     }
-    if not claude_bin:
-        report["error"] = "Claude Code CLI was not found"
+    def fail(
+        code: str, message: str, check: str | None = None,
+        exit_code: int | None = None,
+    ) -> dict[str, Any]:
+        report.update(error_code=code, error=message)
+        if check is not None:
+            report["failed_check"] = check
+        if exit_code is not None:
+            report["exit_code"] = exit_code
         return report
-    version = _capture([claude_bin, "--version"], environ=effective)
-    auth = _capture([claude_bin, "auth", "status", "--json"], environ=effective)
-    help_result = _capture([claude_bin, "--help"], environ=effective)
+
+    if model_error:
+        return fail("model_policy", model_error)
+    if billing:
+        return fail("billing_environment", "API/provider billing environment is active; inference is refused")
+    if not claude_bin:
+        return fail("cli_not_found", "Claude Code CLI was not found")
+
+    results: dict[str, subprocess.CompletedProcess[str]] = {}
+    current_check = "workspace"
+    try:
+        # Каталог сервера может исчезнуть после очистки worktree или кэша плагина.
+        # Не меняем cwd многопоточного сервера и не наследуем настройки проекта.
+        with tempfile.TemporaryDirectory(prefix="agent-harness-readiness-") as directory:
+            for current_check, arguments in (
+                ("version", ["--version"]),
+                ("auth", ["auth", "status", "--json"]),
+                ("help", ["--help"]),
+            ):
+                results[current_check] = _capture(
+                    [claude_bin, *arguments], environ=effective, cwd=Path(directory)
+                )
+    except subprocess.TimeoutExpired:
+        return fail("cli_timeout", "Claude Code readiness command timed out", current_check)
+    except (OSError, subprocess.SubprocessError):
+        return fail("cli_spawn_failed", "Claude Code readiness command could not run in this environment",
+                    current_check)
+
+    version, auth, help_result = (results[key] for key in ("version", "auth", "help"))
+    version_text = version.stdout.strip()
+    if version.returncode == 0 and re.fullmatch(
+        r"\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?(?: \((?:Claude Code|fake)\))?",
+        version_text,
+    ):
+        report["claude"]["version"] = version_text
+    missing_flags = [flag for flag in REQUIRED_FLAGS if flag not in help_result.stdout]
+    report["claude"]["required_flags"] = {
+        "ok": help_result.returncode == 0 and not missing_flags,
+        "missing": missing_flags if help_result.returncode == 0 else [],
+    }
+    if version.returncode != 0:
+        return fail("cli_command_failed", "Claude Code version check failed", "version", version.returncode)
     try:
         auth_object = _json_object(auth.stdout)
+        if type(auth_object.get("loggedIn")) is not bool:
+            raise InputError("Claude Code auth status must contain boolean loggedIn")
     except InputError:
-        auth_object = {"loggedIn": False, "authMethod": "unknown"}
+        if auth.returncode != 0:
+            return fail("cli_command_failed", "Claude Code auth status command failed", "auth", auth.returncode)
+        return fail("auth_invalid_response",
+                    "Claude Code returned an invalid auth status response; authentication is unknown", "auth")
+
+    # CLI может вернуть код 1 при явном loggedIn:false; это не сбой JSON.
+    if auth.returncode != 0 and not (auth.returncode == 1 and auth_object["loggedIn"] is False):
+        return fail("cli_command_failed", "Claude Code auth status command failed", "auth", auth.returncode)
     public_auth = {
         key: auth_object.get(key)
         for key in ("loggedIn", "authMethod", "apiProvider", "subscriptionType")
         if key in auth_object
     }
-    help_text = f"{help_result.stdout}\n{help_result.stderr}"
-    missing_flags = [flag for flag in REQUIRED_FLAGS if flag not in help_text]
-    report["claude"] = {
-        "path": claude_bin,
-        "version": sanitize_text(
-            version.stdout or version.stderr, maximum=200
-        ),
-        "auth": public_auth,
-        "required_flags": {
-            "ok": help_result.returncode == 0 and not missing_flags,
-            "missing": missing_flags,
-        },
-    }
-    if model_error:
-        report["error"] = model_error
-    elif billing:
-        report["error"] = (
-            "API/provider billing environment is active; inference is refused"
-        )
-    elif not bool(public_auth.get("loggedIn")):
-        report["error"] = "Claude Code is not signed in; run claude auth login"
-    elif version.returncode != 0 or auth.returncode != 0:
-        report["error"] = "Claude Code readiness commands failed"
-    elif missing_flags or help_result.returncode != 0:
-        report["error"] = "Claude Code is missing required safety flags"
-    else:
-        report["ok"] = True
+    report["claude"]["auth"] = public_auth
+    if help_result.returncode != 0:
+        return fail("cli_command_failed", "Claude Code help command failed", "help", help_result.returncode)
+    if missing_flags:
+        return fail("missing_safety_flags", "Claude Code is missing required safety flags", "help")
+    if public_auth["loggedIn"] is False:
+        return fail("authentication_required",
+                    "Claude Code reports no login in this environment; compare host auth status "
+                    "before running claude auth login", "auth")
+    model_id = model.lower().removesuffix("[1m]")
+    minimum = MODEL_MINIMUM_CLI.get(model_id)
+    if minimum is not None:
+        required_version = ".".join(map(str, minimum))
+        report["claude"]["minimum_version"] = required_version
+        parsed_version = re.match(r"^(\d+)\.(\d+)\.(\d+)(?: \(|$|\+)", version_text)
+        if report["claude"]["version"] is None or parsed_version is None:
+            return fail("cli_version_unknown",
+                        "Cannot verify Claude Code compatibility with the selected model", "version")
+        if tuple(map(int, parsed_version.groups())) < minimum:
+            return fail("cli_model_incompatible",
+                        f"The selected Claude model requires Claude Code {required_version} or newer; "
+                        "update Claude Code before inference", "version")
+    report["ok"] = True
     return report
 
 
@@ -435,6 +492,30 @@ def _transient_process_failure(value: Any) -> bool:
     return bool(TRANSIENT_PROCESS_FAILURE_RE.search(rendered[-4096:]))
 
 
+def _provider_error_diagnostic(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep fixed codes and HTTP status, never excerpts of provider messages."""
+    values = [payload.get(key) for key in ("error", "error_type", "code", "result", "message", "errors")]
+    # Assistant API errors carry text in message.content; callers exclude normal replies.
+    rendered = json.dumps(values, ensure_ascii=True)[-16384:]
+    diagnostic: dict[str, Any] = {}
+    status = re.search(r"\bAPI Error:\s*([45][0-9]{2})\b", rendered, re.I)
+    if status:
+        diagnostic["http_status"] = int(status.group(1))
+    for key in ("status", "status_code"):
+        if type(payload.get(key)) is int and 400 <= payload[key] <= 599:
+            diagnostic["http_status"] = payload[key]
+            break
+    if re.search(r"thinking\.type\.(?:enabled|disabled).{0,80}(?:not supported|not allowed)", rendered, re.I):
+        diagnostic["code"] = "thinking_config_incompatible"
+    elif re.search(r"effort.{0,80}(?:not supported|not available).{0,80}thinking", rendered, re.I):
+        diagnostic["code"] = "effort_thinking_incompatible"
+    elif diagnostic.get("http_status") == 400:
+        diagnostic["code"] = "api_request_rejected"
+    elif diagnostic:
+        diagnostic["code"] = "api_http_error"
+    return diagnostic
+
+
 def _actual_models(payload: Mapping[str, Any]) -> list[str]:
     candidates: list[str] = []
     direct = _safe_label(payload.get("model"))
@@ -499,6 +580,7 @@ class ManagedStage:
         self._timed_out = False
         self._result_payload: dict[str, Any] | None = None
         self._failure_kind: str | None = None
+        self._provider_diagnostic: dict[str, Any] = {}
         self._limit_seen = False
         self._stderr_scan_tail = ""
         self._stdout_chars = 0
@@ -612,6 +694,8 @@ class ManagedStage:
                 if isinstance(block, Mapping) and block.get("type") == "tool_use":
                     self._record_tool("started", block)
         elif kind == "assistant":
+            if payload.get("error") or payload.get("isApiErrorMessage") is True:
+                self._provider_diagnostic.update(_provider_error_diagnostic(payload))
             message = payload.get("message")
             content = message.get("content") if isinstance(message, Mapping) else None
             if isinstance(content, list):
@@ -688,6 +772,17 @@ class ManagedStage:
             isinstance(self._result_payload, Mapping)
             and self._result_payload.get("is_error") is True
         )
+        diagnostic = dict(self._provider_diagnostic)
+        if (returncode != 0 or result_is_error) and self._result_payload is not None:
+            result_diagnostic = _provider_error_diagnostic(self._result_payload)
+            if result_diagnostic:
+                # The result may repeat only a generic status after a specific assistant error.
+                if diagnostic.get("code") in {"thinking_config_incompatible", "effort_thinking_incompatible"}:
+                    result_diagnostic.pop("code", None)
+                diagnostic.update(result_diagnostic)
+        telemetry["exit_code"] = returncode
+        if diagnostic and (returncode != 0 or result_is_error):
+            telemetry["provider_error"] = diagnostic
         if (
             returncode != 0 and self._limit_seen
         ) or (
@@ -698,6 +793,17 @@ class ManagedStage:
                 "lifecycle_state": "failed",
                 "failure_kind": "anthropic_limit",
                 "error": "Anthropic usage limit reached",
+                "returncode": returncode,
+                "telemetry": telemetry,
+            }
+        if (returncode != 0 or result_is_error) and (
+            diagnostic.get("http_status") == 400
+            or diagnostic.get("code") in {"thinking_config_incompatible", "effort_thinking_incompatible"}
+        ):
+            return {
+                "lifecycle_state": "failed",
+                "failure_kind": self._failure_kind or "request_configuration",
+                "error": "Claude API rejected the request configuration; check CLI/model compatibility",
                 "returncode": returncode,
                 "telemetry": telemetry,
             }

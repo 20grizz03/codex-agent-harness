@@ -194,8 +194,10 @@ import time
 from pathlib import Path
 
 args = sys.argv[1:]
+if os.environ.get("FAKE_CLAUDE_REQUIRE_CWD") == "1":
+    os.getcwd()
 if args == ["--version"]:
-    print("2.1.220 (fake)")
+    print(os.environ.get("FAKE_CLAUDE_VERSION", "2.1.280 (fake)"))
     raise SystemExit(0)
 if args == ["auth", "status", "--json"]:
     print(json.dumps({{
@@ -224,6 +226,12 @@ marker = os.environ.get("FAKE_CLAUDE_MARKER")
 if marker:
     Path(marker).write_text("invoked", encoding="utf-8")
 mode = os.environ.get("FAKE_CLAUDE_MODE", "success")
+if mode in ("api_request_error", "api_assistant_error", "api_zero_exit_error"):
+    message = 'API Error: 400 "thinking.type.enabled" is not supported for this model. Use "thinking.type.adaptive". token=private-provider-value'
+    print(json.dumps({{"type": "assistant", "error": "unknown", "session_id": "private-session-id", "message": {{"content": [{{"type": "text", "text": message}}]}}}}), flush=True)
+    if mode != "api_assistant_error":
+        print(json.dumps({{"type": "result", "subtype": "success", "is_error": True, "result": message}}), flush=True)
+    raise SystemExit(0 if mode == "api_zero_exit_error" else 1)
 if mode == "hang":
     time.sleep(60)
 if mode == "fail":

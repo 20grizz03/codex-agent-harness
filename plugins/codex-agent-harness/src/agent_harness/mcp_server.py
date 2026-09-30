@@ -75,6 +75,14 @@ CHECK_SCHEMA = {
     },
     "additionalProperties": False,
 }
+CODEX_COUNTERS_SCHEMA = {
+    "type": "object",
+    "minProperties": 1,
+    "properties": {key: {"type": "integer", "minimum": 0, "maximum": 10**15}
+                   for key in ("input_tokens", "cached_input_tokens",
+                               "output_tokens", "reasoning_output_tokens")},
+    "additionalProperties": False,
+}
 FINDING_SCHEMA = {
     "type": "object",
     "required": [
@@ -233,6 +241,43 @@ CONTRACT_REF_SCHEMA = {
     },
     "additionalProperties": False,
 }
+SCOPE_PATHS_SCHEMA = {
+    "type": "array", "maxItems": 128,
+    "items": {"type": "string", "minLength": 1, "maxLength": 512},
+    "description": "Exact repository-relative files or directory prefixes ending in /. When supplied, changed paths outside this boundary fail planning.",
+}
+PRODUCT_TARGET_SCHEMA = {
+    "type": "object",
+    "required": ["operating_mode", "runtime_required", "external_dependencies"],
+    "properties": {
+        "operating_mode": {"type": "string", "minLength": 1, "maxLength": 500},
+        "runtime_required": {"type": "boolean"},
+        "external_dependencies": {
+            "type": "array", "maxItems": 32,
+            "items": {"type": "string", "minLength": 1, "maxLength": 1000},
+        },
+    },
+    "additionalProperties": False,
+}
+PRODUCT_EVIDENCE_SCHEMA = {
+    "type": "object", "required": ["runtime", "external"],
+    "properties": {
+        "runtime": {"type": "array", "maxItems": 16,
+                    "items": {"type": "string", "minLength": 1, "maxLength": 1000}},
+        "external": {
+            "type": "object", "maxProperties": 32,
+            "additionalProperties": {
+                "type": "object", "required": ["status", "evidence"],
+                "properties": {
+                    "status": {"type": "string", "enum": ["complete", "blocked"]},
+                    "evidence": {"type": "string", "minLength": 1, "maxLength": 1000},
+                },
+                "additionalProperties": False,
+            },
+        },
+    },
+    "additionalProperties": False,
+}
 CAMPAIGN_TASK_SCHEMA = {
     "type": "object",
     "required": ["id", "title", "goal", "done_when"],
@@ -282,6 +327,7 @@ CAMPAIGN_TASK_SCHEMA = {
         "contract_refs": {
             "type": "array", "maxItems": 64, "items": CONTRACT_REF_SCHEMA,
         },
+        "scope_paths": SCOPE_PATHS_SCHEMA,
         "max_correction_passes": {"type": "integer", "minimum": 0, "maximum": 8},
         "max_critic_retries": {"type": "integer", "minimum": 0, "maximum": 1},
         "wave": {"type": "integer", "minimum": 1, "maximum": 64},
@@ -377,6 +423,7 @@ TOOLS: list[dict[str, Any]] = [
                 "risk": {"type": "string", "enum": ["low", "medium", "high"]},
                 "mode": {"type": "string", "enum": ["delivery", "replay"]},
                 "source": CAMPAIGN_SOURCE_SCHEMA,
+                "product_target": PRODUCT_TARGET_SCHEMA,
                 "spec": CAMPAIGN_SPEC_SCHEMA,
                 "cutoff_at": {"type": "string", "minLength": 1, "maxLength": 64},
                 "tasks": {
@@ -518,6 +565,7 @@ TOOLS: list[dict[str, Any]] = [
                 "workspace": WORKSPACE,
                 "campaign_id": CAMPAIGN_ID,
                 "summary": {"type": "string", "minLength": 1, "maxLength": 4000},
+                "product_evidence": PRODUCT_EVIDENCE_SCHEMA,
             },
             "additionalProperties": False,
         },
@@ -684,6 +732,7 @@ TOOLS: list[dict[str, Any]] = [
                 "contract_refs": {
                     "type": "array", "maxItems": 64, "items": CONTRACT_REF_SCHEMA,
                 },
+                "scope_paths": SCOPE_PATHS_SCHEMA,
                 "allow_dirty": {"type": "boolean"},
                 "base_sha": {
                     "type": "string",
@@ -925,6 +974,35 @@ TOOLS: list[dict[str, Any]] = [
         ),
     },
     {
+        "name": "record_codex_telemetry",
+        "description": (
+            "Record caller-reported native Codex cumulative counter snapshots for a run "
+            "or campaign. This server cannot collect Codex usage automatically. "
+            "Use unavailable when counters are not exposed; never infer cost."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["workspace", "target_type", "target_id", "observation_id",
+                         "role", "attempt_id", "path", "scope_id", "availability"],
+            "properties": {
+                "workspace": WORKSPACE,
+                "target_type": {"type": "string", "enum": ["run", "campaign"]},
+                "target_id": {"type": "string", "maxLength": 128},
+                "observation_id": {"type": "string", "maxLength": 80},
+                "role": {"type": "string", "enum": ["lead", "executor", "reviewer"]},
+                "attempt_id": {"type": "string", "maxLength": 80},
+                "path": {"type": "string", "enum": ["primary", "retry", "fallback"]},
+                "scope_id": {"type": "string", "maxLength": 80},
+                "availability": {"type": "string", "enum": ["available", "partial", "unavailable"]},
+                "reason": {"type": "string", "enum": ["not_exposed", "interrupted", "incomplete_snapshot", "other"]},
+                "baseline": CODEX_COUNTERS_SCHEMA,
+                "final": CODEX_COUNTERS_SCHEMA,
+            },
+            "additionalProperties": False,
+        },
+        "annotations": _annotations("Record reported Codex usage", read_only=False, idempotent=True),
+    },
+    {
         "name": "finish_run",
         "description": (
             "Finish a run. complete is accepted only for the current checked "
@@ -984,6 +1062,7 @@ class McpServer:
             "poll_stage": self.service.poll_stage,
             "cancel_stage": self.service.cancel_stage,
             "record_review_resolution": self.service.record_review_resolution,
+            "record_codex_telemetry": self.service.record_codex_telemetry,
             "finish_run": self.service.finish_run,
         }
 

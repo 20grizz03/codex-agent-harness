@@ -25,7 +25,7 @@ from .campaign import (
     verify_openspec_reference,
 )
 from .claude_runtime import ManagedStage
-from .contract import build_contract, normalize_contract_refs
+from .contract import build_contract, normalize_contract_refs, normalize_scope_paths
 from .followup import FollowupService
 from .git_repo import (
     diff_fingerprint,
@@ -41,11 +41,15 @@ from .policy import (
     validate_risk,
 )
 from .review import build_stage_prompt, validate_review
-from .verification import closeout_paths, correction_context, optional_snapshot
+from .verification import (
+    closeout_paths, correction_context, evidence_identity, optional_snapshot,
+    product_evidence, require_fresh_evidence, require_frozen_contract, scope_violations,
+)
 from .store import RunStore, SCHEMA_VERSION
 from .specification import (
     contract_references, is_native, prepare_spec, public_context, task_snapshot,
 )
+from .telemetry import normalize_observation, record as record_codex_observation, summary as codex_telemetry_summary
 from .util import (
     InputError,
     StateError,
@@ -155,6 +159,7 @@ class HarnessService:
             key: HarnessService._public_stage(stage)
             for key, stage in state.get("stages", {}).items()
         }
+        public_state["codex_telemetry_summary"] = codex_telemetry_summary(state)
         scope = public_state.get("correction_review")
         if isinstance(scope, dict):
             public_state["correction_review"] = {
@@ -181,6 +186,7 @@ class HarnessService:
         diff_fingerprint: Any,
         cycle: int,
         stage_id: str | None = None,
+        identity: Any = None,
     ) -> dict[str, Any]:
         previous_review = review_file.get("review")
         previous_resolutions = review_file.get("resolutions", {})
@@ -233,6 +239,8 @@ class HarnessService:
             "recorded_at": utc_now(),
             "cycle": cycle,
         }
+        if identity is not None:
+            current["evidence_identity"] = identity
         if stage_id is not None:
             current["stage_id"] = stage_id
         review_file["review"] = current
@@ -342,6 +350,7 @@ class HarnessService:
             and stage.get("lifecycle_state") == "failed"
             and stage.get("failure_kind") == "anthropic_limit"
             and stage.get("diff_fingerprint") == state.get("diff_fingerprint")
+            and stage.get("evidence_identity") == state.get("evidence_identity")
             and (
                 expected_cycle is None
                 or stage.get("review_cycle") == expected_cycle
@@ -380,6 +389,7 @@ class HarnessService:
         store = CampaignStore.for_workspace(campaign_workspace)
         campaign_contract = store.read_contract(campaign_id)
         campaign_state = store.read_state(campaign_id)
+        self._require_campaign_contract(store, campaign_contract, campaign_state)
         self._require_campaign_open(campaign_state)
         verify_openspec_reference(campaign_contract, store.context, store.spec_dir(campaign_id))
         definition = self._campaign_task_definition(campaign_contract, task_id)
@@ -447,6 +457,13 @@ class HarnessService:
                 unique_refs.append(dict(reference))
                 seen_refs.add(key)
         arguments["contract_refs"] = unique_refs
+
+        task_scope = list(definition.get("scope_paths", []))
+        if task_scope:
+            supplied_scope = arguments.get("scope_paths")
+            if supplied_scope is not None and normalize_scope_paths(supplied_scope) != task_scope:
+                raise InputError("run scope_paths conflicts with the campaign task")
+            arguments["scope_paths"] = task_scope
 
         task_execution = definition.get("execution")
         if isinstance(task_execution, Mapping):
@@ -737,6 +754,7 @@ class HarnessService:
         contract["runtime_version"] = _runtime_version()
         if parent is not None:
             contract["campaign"] = parent["reference"]
+        state["contract_sha256"] = evidence_identity(context, contract)["contract_sha256"]
         store = RunStore(context)
         with self._lock:
             if followup is not None:
@@ -860,9 +878,11 @@ class HarnessService:
         state: dict[str, Any],
         comparison: dict[str, Any],
     ) -> dict[str, Any]:
+        public_state = dict(state)
+        public_state["codex_telemetry_summary"] = codex_telemetry_summary(state)
         result = {
             "contract": contract,
-            "state": state,
+            "state": public_state,
             "comparison": comparison,
         }
         if is_native(contract.get("spec")):
@@ -871,12 +891,61 @@ class HarnessService:
             )
         return result
 
+    def record_codex_telemetry(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        """Ingest a caller-reported native Codex snapshot pair, never raw logs."""
+        workspace = self._workspace(arguments)
+        target_type = arguments.get("target_type")
+        target_id = require_string(arguments.get("target_id"), "target_id", maximum=128)
+        observation = normalize_observation(arguments)
+        if target_type == "run":
+            store = RunStore.for_workspace(workspace)
+            with self._lock:
+                store.read_contract(target_id)
+                state = store.read_state(target_id)
+                entry, deduplicated = record_codex_observation(state, observation)
+                if not deduplicated:
+                    state = store.save_state(target_id, state)
+                    store.append_event(target_id, {
+                        "type": "codex_telemetry_recorded",
+                        "observation_id": entry["observation_id"],
+                    })
+        elif target_type == "campaign":
+            store = CampaignStore.for_workspace(workspace)
+            with self._lock:
+                store.read_contract(target_id)
+                state = store.read_state(target_id)
+                entry, deduplicated = record_codex_observation(state, observation)
+                if not deduplicated:
+                    state = store.save_state(target_id, state)
+                    store.append_event(target_id, {
+                        "type": "codex_telemetry_recorded",
+                        "observation_id": entry["observation_id"],
+                    })
+        else:
+            raise InputError("target_type must be run or campaign")
+        return {
+            "target_type": target_type,
+            "target_id": target_id,
+            "observation": entry,
+            "summary": codex_telemetry_summary(state),
+            "deduplicated": deduplicated,
+        }
+
     @staticmethod
     def _require_campaign_open(state: Mapping[str, Any]) -> None:
         if state.get("phase") in CAMPAIGN_TERMINAL_PHASES:
             raise StateError(
                 f"campaign is already terminal: {state.get('phase')}"
             )
+
+    @staticmethod
+    def _require_campaign_contract(
+        store: CampaignStore, contract: Mapping[str, Any], state: Mapping[str, Any],
+    ) -> None:
+        pinned = state.get("contract_sha256")
+        # Older campaigns predate this anchor; keep their existing completion path.
+        if pinned is not None and pinned != evidence_identity(store.context, contract)["contract_sha256"]:
+            raise StateError("frozen campaign contract changed; create a newly approved campaign")
 
     def create_campaign(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
         workspace = self._workspace(arguments)
@@ -887,6 +956,7 @@ class HarnessService:
         state["runtime_versions"] = [
             {"version": version, "at": state["created_at"], "reason": "created"}
         ]
+        state["contract_sha256"] = evidence_identity(context, contract)["contract_sha256"]
         store = CampaignStore(context)
         with self._lock:
             store.create(contract, state, spec_files)
@@ -1152,6 +1222,7 @@ class HarnessService:
         with self._lock:
             contract = store.read_contract(campaign_id)
             state = store.read_state(campaign_id)
+            self._require_campaign_contract(store, contract, state)
             definition = self._campaign_task_definition(contract, task_id)
             task_states = state.get("tasks")
             if not isinstance(task_states, dict):
@@ -1462,8 +1533,20 @@ class HarnessService:
         with self._lock:
             contract = store.read_contract(campaign_id)
             state = store.read_state(campaign_id)
+            self._require_campaign_contract(store, contract, state)
             existing = state.get("candidate")
             if isinstance(existing, dict):
+                try:
+                    current_snapshots = self._candidate_git_snapshots(
+                        contract, state.get("tasks", {})
+                    )
+                except StateError as exc:
+                    raise StateError(
+                        "sealed candidate is stale; use a scoped follow-up or a new campaign: "
+                        + str(exc)
+                    ) from exc
+                if existing.get("git_snapshots") != current_snapshots:
+                    raise StateError("sealed candidate is stale; use a scoped follow-up or a new campaign")
                 if existing.get("summary") != summary:
                     raise StateError("campaign candidate is already sealed")
                 return {
@@ -1504,6 +1587,11 @@ class HarnessService:
                     "multi-task repositories require a completed combined "
                     "integration run: " + ", ".join(integration_gaps)
                 )
+            operating_evidence, product_blockers = product_evidence(
+                contract.get("product_target"), arguments.get("product_evidence")
+            )
+            if product_blockers:
+                raise StateError("product gate failed: " + "; ".join(product_blockers))
             interventions = state.get("interventions", {})
             run_references = [
                 task["run"]
@@ -1525,6 +1613,7 @@ class HarnessService:
                 "task_count": len(task_states),
                 "run_references": run_references,
                 "git_snapshots": git_snapshots,
+                "product_evidence": operating_evidence,
                 "human_interventions": {
                     "total": len(interventions),
                     "blocking_questions": sum(
@@ -1725,6 +1814,7 @@ class HarnessService:
         with self._lock:
             contract = store.read_contract(campaign_id)
             state = store.read_state(campaign_id)
+            self._require_campaign_contract(store, contract, state)
             existing = state.get("terminal")
             if isinstance(existing, dict):
                 if existing.get("status") == status:
@@ -1745,6 +1835,23 @@ class HarnessService:
                 )
                 if not isinstance(state.get("candidate"), dict):
                     raise StateError("campaign candidate is not sealed")
+                candidate = state["candidate"]
+                try:
+                    current_snapshots = self._candidate_git_snapshots(
+                        contract, state.get("tasks", {})
+                    )
+                except StateError as exc:
+                    raise StateError(
+                        "campaign candidate Git evidence is stale; use a scoped follow-up or a new campaign: "
+                        + str(exc)
+                    ) from exc
+                if candidate.get("git_snapshots") != current_snapshots:
+                    raise StateError("campaign candidate Git evidence is stale; use a scoped follow-up or a new campaign")
+                _, product_blockers = product_evidence(
+                    contract.get("product_target"), candidate.get("product_evidence")
+                )
+                if product_blockers:
+                    raise StateError("product gate failed: " + "; ".join(product_blockers))
                 unresolved = self._unresolved_campaign_blockers(state)
                 if unresolved:
                     raise StateError(
@@ -1819,14 +1926,21 @@ class HarnessService:
                 store, run_id, store.read_state(run_id)
             )
             self._require_open(state)
+            require_frozen_contract(store.context, contract, state)
             measurement = self._measure_current_diff(store, contract)
             self._guard_followup(contract)
             fingerprint = str(measurement["diff_fingerprint"])
             paths = list(measurement["changed_paths"])
+            unexpected = scope_violations(paths, contract.get("scope_paths", []))
+            if unexpected:
+                raise StateError("changed paths exceed frozen scope: " + ", ".join(unexpected[:8]))
+            identity = evidence_identity(store.context, contract)
+            identity_changed = state.get("evidence_identity") != identity
             statistics = dict(measurement["diff_stats"])
             budget_status = str(measurement["budget_status"])
             previous = state.get("diff_fingerprint")
-            if previous == fingerprint and isinstance(state.get("diff_stats"), dict):
+            if (previous == fingerprint and not identity_changed
+                    and isinstance(state.get("diff_stats"), dict)):
                 return {
                     "run_id": run_id,
                     "diff_fingerprint": fingerprint,
@@ -1861,7 +1975,7 @@ class HarnessService:
                 isinstance(review_summary, Mapping)
                 and review_summary.get("diff_fingerprint") == previous
             )
-            if not closeout and (
+            if not closeout and not identity_changed and (
                 phase == "reviewing" or (phase == "checking" and reviewed_previous)
             ):
                 if not begin_correction:
@@ -1918,6 +2032,10 @@ class HarnessService:
                 changed_paths=paths,
             )
             state["diff_fingerprint"] = fingerprint
+            state["evidence_identity"] = identity
+            if identity_changed:
+                state["review_summary"] = None
+                state.setdefault("check_results", {})[fingerprint] = {}
             state["planned_snapshot"] = snapshot
             state["review_closeout"] = closeout_record
             state["correction_review"] = correction_context(
@@ -1982,8 +2100,10 @@ class HarnessService:
                 store, run_id, store.read_state(run_id)
             )
             self._require_open(state)
+            require_frozen_contract(store.context, contract, state)
             if state.get("phase") != "checking":
                 raise StateError("checks may be recorded only in the checking phase")
+            require_fresh_evidence(store.context, contract, state.get("evidence_identity"))
             self._guard_followup(contract)
             current, _paths = diff_fingerprint(
                 store.context, base_sha=str(contract["base_sha"])
@@ -2242,10 +2362,11 @@ class HarnessService:
                     current_fingerprint, _paths = diff_fingerprint(
                         store.context, base_sha=str(contract["base_sha"])
                     )
-                    if stage.get("diff_fingerprint") != current_fingerprint:
+                    if (stage.get("diff_fingerprint") != current_fingerprint
+                            or stage.get("evidence_identity") != evidence_identity(store.context, contract)):
                         stage["lifecycle_state"] = "failed"
                         stage["failure_kind"] = "stale_review"
-                        stage["error"] = "Critic result does not describe the current diff"
+                        stage["error"] = "Critic result does not describe the current HEAD, contract, and diff"
                         self._transition(state, "checking")
                         store.save_state(run_id, state)
                         store.append_event(
@@ -2269,6 +2390,7 @@ class HarnessService:
                         diff_fingerprint=stage.get("diff_fingerprint"),
                         cycle=cycle,
                         stage_id=stage_id,
+                        identity=stage.get("evidence_identity"),
                     )
                     store.save_review(run_id, review_file)
                     state["review_cycle"] = cycle
@@ -2361,6 +2483,7 @@ class HarnessService:
                 store, run_id, store.read_state(run_id)
             )
             self._require_open(state)
+            require_frozen_contract(store.context, contract, state)
             stages = state.setdefault("stages", {})
             self._guard_followup(contract)
             if retry_stage_id is not None:
@@ -2390,6 +2513,7 @@ class HarnessService:
                         "deduplicated": True,
                     }
             if profile == "critic":
+                require_fresh_evidence(store.context, contract, state.get("evidence_identity"))
                 if contract.get("writer") != "codex":
                     raise StateError("Claude cannot criticise its own implementation")
                 current_fingerprint, _paths = diff_fingerprint(
@@ -2430,6 +2554,8 @@ class HarnessService:
                     raise StateError("critic stage failure is not eligible for retry")
                 if retry_source.get("diff_fingerprint") != state.get("diff_fingerprint"):
                     raise StateError("critic retry must use the same checked diff")
+                if retry_source.get("evidence_identity") != state.get("evidence_identity"):
+                    raise StateError("critic retry must use the same checked HEAD and contract")
                 if int(state.get("critic_retries", 0)) >= int(
                     contract.get("max_critic_retries", 0)
                 ):
@@ -2443,6 +2569,8 @@ class HarnessService:
                         and candidate.get("profile") == profile
                         and candidate.get("diff_fingerprint")
                         == state.get("diff_fingerprint")
+                        and (profile != "critic" or candidate.get("evidence_identity")
+                             == state.get("evidence_identity"))
                         and (
                             profile != "critic"
                             or candidate.get("review_cycle")
@@ -2507,6 +2635,7 @@ class HarnessService:
                     "started_at": utc_now(),
                     "finished_at": utc_now(),
                     "diff_fingerprint": state.get("diff_fingerprint"),
+                    "evidence_identity": state.get("evidence_identity"),
                     "requested_model": model,
                     "requested_effort": "high",
                     "runtime_version": contract.get("runtime_version", "unknown"),
@@ -2557,6 +2686,7 @@ class HarnessService:
                 "lifecycle_state": "running",
                 "started_at": utc_now(),
                 "diff_fingerprint": state.get("diff_fingerprint"),
+                "evidence_identity": state.get("evidence_identity"),
                 "requested_model": model,
                 "requested_effort": "high",
                 "runtime_version": contract.get("runtime_version", "unknown"),
@@ -2744,6 +2874,8 @@ class HarnessService:
                 store, run_id, store.read_state(run_id)
             )
             self._require_open(state)
+            require_frozen_contract(store.context, contract, state)
+            require_fresh_evidence(store.context, contract, state.get("evidence_identity"))
             actual_fingerprint, _paths = diff_fingerprint(
                 store.context, base_sha=str(contract["base_sha"])
             )
@@ -2776,9 +2908,9 @@ class HarnessService:
                 ) != "completed":
                     raise StateError("Claude implementation stage is not complete")
                 if supplied_review is not None:
-                    if isinstance(review, dict) and review.get(
-                        "diff_fingerprint"
-                    ) == state.get("diff_fingerprint"):
+                    if (isinstance(review, dict)
+                            and review.get("diff_fingerprint") == state.get("diff_fingerprint")
+                            and review.get("evidence_identity") == state.get("evidence_identity")):
                         raise StateError("independent review is already recorded")
                     cycle = int(state.get("review_cycle", 0)) + 1
                     review = self._replace_current_review(
@@ -2786,6 +2918,7 @@ class HarnessService:
                         validate_review(supplied_review, origin="codex"),
                         diff_fingerprint=state.get("diff_fingerprint"),
                         cycle=cycle,
+                        identity=state.get("evidence_identity"),
                     )
                     state["review_cycle"] = cycle
                 elif not isinstance(review, dict) or review.get(
@@ -2795,9 +2928,9 @@ class HarnessService:
             else:
                 fallback_allowed = self._codex_fallback_allowed(state)
                 if supplied_review is not None and fallback_allowed:
-                    if isinstance(review, dict) and review.get(
-                        "diff_fingerprint"
-                    ) == state.get("diff_fingerprint"):
+                    if (isinstance(review, dict)
+                            and review.get("diff_fingerprint") == state.get("diff_fingerprint")
+                            and review.get("evidence_identity") == state.get("evidence_identity")):
                         raise StateError("independent review is already recorded")
                     cycle = int(state.get("review_cycle", 0)) + 1
                     review = self._replace_current_review(
@@ -2805,6 +2938,7 @@ class HarnessService:
                         validate_review(supplied_review, origin="codex_fallback"),
                         diff_fingerprint=state.get("diff_fingerprint"),
                         cycle=cycle,
+                        identity=state.get("evidence_identity"),
                     )
                     state["review_cycle"] = cycle
                 elif supplied_review is not None:
@@ -2823,6 +2957,8 @@ class HarnessService:
 
             if review.get("diff_fingerprint") != review_fingerprint:
                 raise StateError("review does not describe the current diff fingerprint")
+            if not closeout and review.get("evidence_identity") != state.get("evidence_identity"):
+                raise StateError("review is stale for the current HEAD or contract")
             if supplied_review is not None:
                 state["review_snapshot"] = state.get("planned_snapshot")
                 state["review_closeout"] = None
@@ -2907,6 +3043,14 @@ class HarnessService:
     ) -> list[str]:
         blockers: list[str] = []
         try:
+            require_frozen_contract(store.context, contract, state)
+        except StateError as exc:
+            blockers.append(str(exc))
+        try:
+            require_fresh_evidence(store.context, contract, state.get("evidence_identity"))
+        except StateError as exc:
+            blockers.append(str(exc))
+        try:
             self._guard_followup(contract)
         except (StateError, InputError) as exc:
             blockers.append(str(exc))
@@ -2967,6 +3111,16 @@ class HarnessService:
             blockers.append("review origin is not independent from the writer")
         if review.get("diff_fingerprint") != reviewed_fingerprint:
             blockers.append("review does not describe the current diff")
+        if not closeout and review.get("evidence_identity") != state.get("evidence_identity"):
+            blockers.append("review is stale for the current HEAD or contract")
+        if not closeout and state.get("evidence_identity") is not None and not any(
+            isinstance(stage, dict)
+            and stage.get("profile") == "critic"
+            and stage.get("lifecycle_state") == "completed"
+            and stage.get("evidence_identity") == state.get("evidence_identity")
+            for stage in state.get("stages", {}).values()
+        ) and review.get("origin") == "claude":
+            blockers.append("review is stale for the current HEAD or contract")
         if review.get("blocking_question"):
             blockers.append("review has a blocking question")
         resolutions = review_file.get("resolutions", {})

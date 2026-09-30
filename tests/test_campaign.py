@@ -82,6 +82,90 @@ def complete_run(repo: _support.TempRepo | Path, run_id: str) -> None:
 
 
 class CampaignTests(unittest.TestCase):
+    def test_product_target_cannot_be_removed_after_campaign_creation(self) -> None:
+        with _support.TempRepo() as repo:
+            service = HarnessService({})
+            arguments = campaign_arguments(repo, tasks=[task("pilot")])
+            arguments["product_target"] = {
+                "operating_mode": "SIP pilot on test VM",
+                "runtime_required": True,
+                "external_dependencies": [],
+            }
+            campaign = service.create_campaign(arguments)["contract"]
+            common = {"workspace": str(repo.path), "campaign_id": campaign["campaign_id"]}
+            service.record_campaign_task({**common, "task_id": "pilot", "status": "complete"})
+            store = CampaignStore.for_workspace(repo.path)
+            path = store.campaign_dir(campaign["campaign_id"]) / "contract.json"
+            changed = json.loads(path.read_text(encoding="utf-8"))
+            changed["product_target"] = None
+            path.write_text(json.dumps(changed), encoding="utf-8")
+            with self.assertRaisesRegex(StateError, "frozen campaign contract"):
+                service.seal_campaign_candidate({**common, "summary": "Pilot ready"})
+
+    def test_sealed_candidate_drift_requires_new_scoped_work(self) -> None:
+        with _support.TempRepo() as repo:
+            service = HarnessService({})
+            campaign = service.create_campaign(campaign_arguments(repo))["contract"]
+            common = {"workspace": str(repo.path), "campaign_id": campaign["campaign_id"]}
+            service.record_campaign_task({**common, "task_id": "T-1", "status": "complete"})
+            service.seal_campaign_candidate({**common, "summary": "Ready"})
+            _support.git(repo.path, "commit", "--allow-empty", "-m", "advance head")
+            with self.assertRaisesRegex(StateError, "scoped follow-up or a new campaign"):
+                service.seal_campaign_candidate({**common, "summary": "Ready"})
+            with self.assertRaisesRegex(StateError, "scoped follow-up or a new campaign"):
+                service.seal_campaign_candidate({**common, "summary": "Updated summary"})
+            with self.assertRaisesRegex(StateError, "scoped follow-up or a new campaign"):
+                service.finish_campaign({**common, "status": "complete"})
+            (repo.path / "new-unreviewed.py").write_text("print('new')\n")
+            with self.assertRaisesRegex(StateError, "scoped follow-up or a new campaign"):
+                service.seal_campaign_candidate({**common, "summary": "Ready"})
+            with self.assertRaisesRegex(StateError, "scoped follow-up or a new campaign"):
+                service.finish_campaign({**common, "status": "complete"})
+
+    def test_sip_pilot_and_later_production_have_distinct_product_gates(self) -> None:
+        with _support.TempRepo() as repo:
+            service = HarnessService({})
+            pilot_args = campaign_arguments(repo, tasks=[task("pilot")])
+            pilot_args["product_target"] = {
+                "operating_mode": "Pilot on test VM; production excluded",
+                "runtime_required": True,
+                "external_dependencies": [],
+            }
+            pilot = service.create_campaign(pilot_args)["contract"]
+            common = {"workspace": str(repo.path), "campaign_id": pilot["campaign_id"]}
+            service.record_campaign_task({**common, "task_id": "pilot", "status": "complete"})
+            sealed = service.seal_campaign_candidate({
+                **common, "summary": "Pilot complete",
+                "product_evidence": {
+                    "runtime": ["Test VM SIP flow observed 180/183 and CANCEL"],
+                    "external": {},
+                },
+            })
+            self.assertEqual("ready", sealed["candidate"]["readiness"])
+            self.assertEqual("complete", service.finish_campaign({
+                **common, "status": "complete", "summary": "Pilot delivered to test VM",
+            })["terminal"]["status"])
+
+            production_args = campaign_arguments(repo, tasks=[task("release")])
+            production_args["product_target"] = {
+                "operating_mode": "Production SIP service",
+                "runtime_required": True,
+                "external_dependencies": ["production deployment"],
+            }
+            production = service.create_campaign(production_args)["contract"]
+            common = {"workspace": str(repo.path), "campaign_id": production["campaign_id"]}
+            service.record_campaign_task({**common, "task_id": "release", "status": "complete"})
+            with self.assertRaisesRegex(StateError, "runtime evidence"):
+                service.seal_campaign_candidate({
+                    **common, "summary": "Files installed but SIP flow unverified",
+                    "product_evidence": {
+                        "runtime": [],
+                        "external": {"production deployment": {
+                            "status": "blocked", "evidence": "Deployment approval pending",
+                        }},
+                    },
+                })
+
     def test_linked_run_inherits_pinned_task_contract_and_may_only_add(self) -> None:
         with _support.TempRepo() as repo:
             definition = task("T-1", kind="implementation")
@@ -93,6 +177,7 @@ class CampaignTests(unittest.TestCase):
                         {"name": "unit", "argv": ["python3", "-m", "unittest"]}
                     ],
                     "contract_refs": [{"ref": "spec:api", "revision": "sha256:123"}],
+                    "scope_paths": ["internal/push/"],
                 }
             )
             arguments = campaign_arguments(repo, tasks=[definition])
@@ -142,6 +227,7 @@ class CampaignTests(unittest.TestCase):
                 [{"ref": "spec:api", "revision": "sha256:123"}],
                 run["contract_refs"],
             )
+            self.assertEqual(["internal/push/"], run["scope_paths"])
 
             with self.assertRaisesRegex(InputError, "goal conflicts"):
                 service.create_run(
@@ -256,6 +342,9 @@ class CampaignTests(unittest.TestCase):
             contract["tasks"][0].pop("max_correction_passes")
             contract["tasks"][0].pop("max_critic_retries")
             contract_path.write_text(json.dumps(contract), encoding="utf-8")
+            state = store.read_state(campaign_id)
+            state.pop("contract_sha256", None)  # A pre-anchor campaign has no digest.
+            store.save_state(campaign_id, state)
             service.record_campaign_task(
                 {
                     "workspace": str(repo.path),
@@ -308,6 +397,9 @@ class CampaignTests(unittest.TestCase):
             ):
                 contract["tasks"][0].pop(field)
             contract_path.write_text(json.dumps(contract), encoding="utf-8")
+            state = store.read_state(campaign_id)
+            state.pop("contract_sha256", None)  # Emulate the stored legacy state too.
+            store.save_state(campaign_id, state)
             service.record_campaign_task(
                 {
                     "workspace": str(repo.path),
@@ -1351,6 +1443,7 @@ class CampaignTests(unittest.TestCase):
                 definition.pop("wave")
             contract_path.write_text(json.dumps(contract), encoding="utf-8")
             state = store.read_state(campaign_id)
+            state.pop("contract_sha256", None)  # Legacy contracts predate the anchor.
             state["tasks"]["T-1"]["status"] = "complete"
             state["tasks"]["T-2"]["status"] = "in_progress"
             store.save_state(campaign_id, state)

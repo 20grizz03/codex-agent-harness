@@ -16,6 +16,7 @@ from .contract import (
     DEFAULT_FORBIDDEN_ACTIONS,
     normalize_contract_refs,
     normalize_execution,
+    normalize_scope_paths,
 )
 from .git_repo import RepoContext, resolve_repo, run_git, status_snapshot
 from .policy import validate_checks, validate_risk
@@ -172,6 +173,29 @@ def _source(value: Any) -> dict[str, str]:
         "ref": _sanitized_string(
             source.get("ref"), "source.ref", maximum=2_000
         ),
+    }
+
+
+def normalize_product_target(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    target = _exact_object(
+        value, "product_target",
+        allowed={"operating_mode", "runtime_required", "external_dependencies"},
+    )
+    mode = _sanitized_string(target.get("operating_mode"), "product_target.operating_mode", maximum=500)
+    runtime_required = target.get("runtime_required")
+    if not isinstance(runtime_required, bool):
+        raise InputError("product_target.runtime_required must be a boolean")
+    dependencies = _sanitized_string_list(
+        target.get("external_dependencies"), "product_target.external_dependencies"
+    )
+    if len(dependencies) > 32:
+        raise InputError("product_target.external_dependencies must contain at most 32 entries")
+    return {
+        "operating_mode": mode,
+        "runtime_required": runtime_required,
+        "external_dependencies": list(dict.fromkeys(dependencies)),
     }
 
 
@@ -530,6 +554,7 @@ def _tasks(value: Any) -> list[dict[str, Any]]:
                 "non_goals",
                 "required_checks",
                 "contract_refs",
+                "scope_paths",
                 "max_correction_passes",
                 "max_critic_retries",
                 "wave",
@@ -609,6 +634,7 @@ def _tasks(value: Any) -> list[dict[str, Any]]:
             normalized["contract_refs"] = normalize_contract_refs(
                 task.get("contract_refs")
             )
+            normalized["scope_paths"] = normalize_scope_paths(task.get("scope_paths"))
             normalized["required_checks"] = validate_checks(
                 task.get("required_checks", []), source="campaign_task"
             )
@@ -698,6 +724,7 @@ def build_campaign(
             "spec",
             "cutoff_at",
             "tasks",
+            "product_target",
         },
     )
     mode = require_string(arguments.get("mode", "delivery"), "mode", maximum=32)
@@ -881,6 +908,7 @@ def build_campaign(
         "cutoff_at": cutoff_at,
         "withheld_evidence": REPLAY_WITHHELD_EVIDENCE if mode == "replay" else [],
         "tasks": tasks,
+        "product_target": normalize_product_target(arguments.get("product_target")),
         "integration_policy": "combined-review-when-needed",
         "interaction_policy": (
             "задавать вопросы только при блокирующем продуктовом выборе "

@@ -34,6 +34,7 @@ EXPECTED_TOOLS = {
     "poll_stage",
     "cancel_stage",
     "record_review_resolution",
+    "record_codex_telemetry",
     "finish_run",
 }
 
@@ -74,6 +75,13 @@ class McpContractTests(unittest.TestCase):
                 schema["properties"]["max_production_lines"]["maximum"],
             )
             self.assertFalse(schema["additionalProperties"])
+
+    def test_scope_and_product_gates_are_exposed(self) -> None:
+        tools = {tool["name"]: tool["inputSchema"]["properties"] for tool in TOOLS}
+        self.assertIn("scope_paths", tools["create_run"])
+        self.assertIn("scope_paths", tools["create_campaign"]["tasks"]["items"]["properties"])
+        self.assertIn("product_target", tools["create_campaign"])
+        self.assertIn("product_evidence", tools["seal_campaign_candidate"])
 
     def test_standalone_spec_schema_requires_ready_native_contract(self) -> None:
         create_run = next(tool for tool in TOOLS if tool["name"] == "create_run")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import PurePosixPath
 from typing import Any
 
 from .budget import normalize_review_budget, validate_review_budget_mode
@@ -32,6 +33,25 @@ DEFAULT_EXECUTION = {
     "escalation_model": None,
 }
 NATIVE_REASONING_EFFORTS = {"low", "medium", "high", "xhigh", "max", "ultra"}
+
+
+def normalize_scope_paths(value: Any) -> list[str]:
+    """Optional exact files or directory prefixes ending in /.
+
+    A missing boundary means the review must judge semantic scope. When a
+    boundary is supplied, the server can reject paths outside it.
+    """
+    if value is None:
+        return []
+    paths = require_string_list(value, "scope_paths", maximum_items=128, item_maximum=512)
+    for path in paths:
+        parts = PurePosixPath(path).parts
+        if (path.startswith("/") or "\\" in path or not parts or
+                any(char in path for char in "*?[]") or
+                any(part in {".", ".."} for part in path.split("/")) or
+                "//" in path or path == "."):
+            raise InputError("scope_paths must be repository-relative files or directory prefixes")
+    return list(dict.fromkeys(paths))
 
 
 def normalize_execution(value: Any) -> dict[str, Any]:
@@ -175,6 +195,7 @@ def build_contract(
         "risk": risk,
         "execution": normalize_execution(arguments.get("execution")),
         "contract_refs": normalize_contract_refs(arguments.get("contract_refs")),
+        "scope_paths": normalize_scope_paths(arguments.get("scope_paths")),
         "review_budget": review_budget,
         "review_budget_mode": review_budget_mode,
         "required_checks": frozen_checks,
